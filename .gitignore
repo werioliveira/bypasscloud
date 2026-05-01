@@ -1,0 +1,31 @@
+# Ambiente virtual Python
+venv/
+env/
+.venv/
+*.egg-info/
+
+# Arquivos compilados e cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE e editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Docker
+docker-compose.override.yml
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Configurações locais (se houver)
+.env
+local_config.py
