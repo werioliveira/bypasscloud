@@ -10,6 +10,7 @@ from utils import is_safe_url
 from bypasser import CloudflareBypasserEvolved
 from browser import create_browser
 from bypasser import CloudflareBypasserEvolved, AccessDeniedException
+from DrissionPage.errors import PageDisconnectedError
 logger = logging.getLogger("cloudflare-bypass.api")
 
 # Armazena navegadores por chave (proxy string ou 'default')
@@ -120,11 +121,12 @@ async def solver_endpoint(request: ClientRequest):
             logger.error(f"Erro ao processar requisição: {e}")
             raise HTTPException(status_code=500, detail=str(e))
         finally:
-            # Apenas fecha a aba, nunca o navegador
             if tab:
                 try:
                     tab.close()
-                except:
+                except PageDisconnectedError:
+                    logger.debug("Tab já estava desconectada ao tentar fechar.")
+                except Exception:
                     pass
 
 @app.get("/health")

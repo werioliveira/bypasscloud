@@ -133,7 +133,7 @@ class CloudflareBypasserEvolved:
                 time.sleep(1)
                 continue
             try:
-                self.page.wait.load_complete(timeout=5)
+                self.page.wait.load_complete(timeout=8)
             except Exception:
                 pass
             if not self._title_contains(CHALLENGE_TITLES) and \

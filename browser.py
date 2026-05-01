@@ -16,6 +16,10 @@ def create_browser(proxy: str = None, headless: bool = False):
     options.set_argument("--disable-extensions")
     options.set_argument("--disable-software-rasterizer")
     #options.set_argument("--blink-settings=imagesEnabled=false")
+    options.set_argument("--disable-dev-shm-usage")      # evita crash em /dev/shm limitado
+    options.set_argument("--disable-features=TranslateUI") # desabilita popup de tradução
+    options.set_argument("--no-first-run")
+    options.set_argument("--disable-default-apps")
     if is_windows:
         logger.info("Executando no Windows")
     else:
