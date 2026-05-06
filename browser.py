@@ -8,18 +8,33 @@ logger = logging.getLogger("cloudflare-bypass.browser")
 def create_browser(proxy: str = None, headless: bool = False):
     is_windows = platform.system() == "Windows"
     options = ChromiumOptions()
-
-    # Argumentos comuns
-    options.set_argument("--no-sandbox")
+    
+    # --- OTIMIZAÇÕES DE RAM E CPU (DIETA DO CHROME) ---
     options.set_argument("--disable-gpu")
-    options.set_argument("--disable-blink-features=AutomationControlled")
-    options.set_argument("--disable-extensions")
     options.set_argument("--disable-software-rasterizer")
+    options.set_argument("--no-sandbox")
+    options.set_argument("--disable-dev-shm-usage") # Usa a memória do sistema ao invés do /dev/shm
+    
+    #O CORINGA: Desativa o carregamento de imagens. Economiza uns 40% de RAM e CPU ( cloudflare está detectando ).
     #options.set_argument("--blink-settings=imagesEnabled=false")
-    options.set_argument("--disable-dev-shm-usage")      # evita crash em /dev/shm limitado
-    options.set_argument("--disable-features=TranslateUI") # desabilita popup de tradução
-    options.set_argument("--no-first-run")
+    
+    # Limita a memória RAM que o motor JavaScript (V8) pode usar para 256MB (O padrão é 1.5GB!)
+    options.set_argument("--js-flags=--max-old-space-size=256")
+    
+    # Mata processos em background do Chrome que não fazem falta pro bypass
+    options.set_argument("--disable-background-networking")
     options.set_argument("--disable-default-apps")
+    options.set_argument("--disable-sync")
+    options.set_argument("--disable-translate")
+    options.set_argument("--disable-extensions")
+    options.set_argument("--disable-component-extensions-with-background-pages")
+    options.set_argument("--no-first-run")
+    options.set_argument("--safebrowsing-disable-auto-update")
+    options.set_argument("--disable-breakpad") # Impede a criação de logs de crash que enchem o disco
+    # ------------------------------------------------
+
+    # Anti-detecção
+    options.set_argument("--disable-blink-features=AutomationControlled")
     if is_windows:
         logger.info("Executando no Windows")
     else:
