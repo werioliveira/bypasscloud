@@ -18,6 +18,7 @@ logger = logging.getLogger("cloudflare-bypass.api")
 browsers_data = {} 
 MAX_CONCURRENT_REQUESTS = 5
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+browser_lock = asyncio.Lock()
 MAX_REQUESTS_BEFORE_RESTART = 30
 
 @asynccontextmanager
@@ -56,14 +57,15 @@ async def get_browser(proxy: str = None):
     key = proxy if proxy else 'default'
     
     # Se não existe ou o navegador morreu, cria um novo
-    if key not in browsers_data or browsers_data[key]['browser'] is None:
-        logger.info(f"Criando navegador para: {key}")
-        try:
-            new_browser = await asyncio.to_thread(create_browser, proxy=proxy)
-            browsers_data[key] = {'browser': new_browser, 'count': 0}
-        except Exception as e:
-            logger.error(f"Erro ao criar navegador: {e}")
-            raise HTTPException(status_code=400, detail=f"Proxy inválido ou erro ao iniciar browser: {e}")
+    async with browser_lock: # <--- Garante que apenas UM browser seja criado por vez
+        if key not in browsers_data or browsers_data[key]['browser'] is None:
+            logger.info(f"Criando navegador para: {key}")
+            try:
+                new_browser = await asyncio.to_thread(create_browser, proxy=proxy)
+                browsers_data[key] = {'browser': new_browser, 'count': 0}
+            except Exception as e:
+                logger.error(f"Erro ao criar navegador: {e}")
+                raise HTTPException(status_code=400, detail=f"Erro ao iniciar browser: {e}")
 
     browser_info = browsers_data[key]
     
