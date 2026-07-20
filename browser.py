@@ -5,20 +5,19 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 
 logger = logging.getLogger("cloudflare-bypass.browser")
 
-def create_browser(proxy: str = None, headless: bool = False):
+# Adicionado o parâmetro instance_id para isolar perfis e portas
+def create_browser(proxy: str = None, headless: bool = False, instance_id: str = "default"):
     is_windows = platform.system() == "Windows"
     options = ChromiumOptions()
     
     # --- 1. PREVENÇÃO CONTRA CRASHES EM DOCKER/WSL ---
-    # Essas flags resolvem o Trace/breakpoint trap e falta de memória
     options.set_argument("--no-sandbox")
     options.set_argument("--disable-setuid-sandbox")
-    options.set_argument("--disable-dev-shm-usage") # Crucial para VPS com pouca RAM
+    options.set_argument("--disable-dev-shm-usage") 
     options.set_argument("--enable-webgl")
     options.set_argument("--use-gl=angle")
     options.set_argument("--use-angle=swiftshader")
     
-    # Desativa telemetria e checagens de CPU que falham em containers
     options.set_argument("--disable-logging")
     options.set_argument("--log-level=3")
     options.set_argument("--no-crash-upload")
@@ -26,9 +25,11 @@ def create_browser(proxy: str = None, headless: bool = False):
     options.set_argument("--disable-perf-profiling")
     options.set_argument("--disable-features=Diagnostics")
 
-# --- 2. CONFIGURAÇÃO DE SISTEMA OPERACIONAL ---
+    # --- 2. CONFIGURAÇÃO DE SISTEMA OPERACIONAL ---
     if is_windows:
         logger.info("Executando no Windows")
+        options.set_argument("--force-renderer-accessibility") 
+        options.set_argument("--no-default-browser-check")
         options.headless(False)
         options.auto_port()
     else:
@@ -37,16 +38,16 @@ def create_browser(proxy: str = None, headless: bool = False):
         browser_path = os.getenv("CHROMIUM_PATH", "/usr/bin/google-chrome-stable")
         options.set_paths(browser_path=browser_path)
         
-        # Garante portas dinâmicas e limpas para evitar colisões no Docker
+        # CORREÇÃO 1: Usar auto_port() para evitar colisão de portas ao recriar navegadores
         options.auto_port() 
         
-        # Força headless correto no Linux
         options.set_argument("--headless=new")
         options.set_argument("--accept-lang=en-US")
         
-        # IMPORTANTE: No DrissionPage, use set_user_data_path e deixe ele gerenciar
-        # Adicione um timestamp ou número aleatório se os navegadores abrirem juntos
-        options.set_user_data_path("/tmp/drission_profiles")
+        # CORREÇÃO 2: Isolar o perfil por instância (evita o erro de SingletonLock do Chrome)
+        safe_id = instance_id.replace(":", "_").replace("/", "_")
+        profile_path = f"/tmp/drission_profiles/{safe_id}"
+        options.set_user_data_path(profile_path)
 
     # --- 3. ANTI-DETECÇÃO ---
     options.set_argument("--disable-blink-features=AutomationControlled")
@@ -56,16 +57,11 @@ def create_browser(proxy: str = None, headless: bool = False):
         logger.info(f"Configurando proxy via argumento: --proxy-server={proxy}")
         options.set_argument(f"--proxy-server={proxy}")
 
-    # --- 5. PORTA CDP ---
-    # No Linux Docker, fixar a porta é mais estável para o DrissionPage se conectar
-    if not is_windows:
-        options.set_local_port(9605)
-    else:
-        options.auto_port()
+    # REMOVIDO: O set_local_port(9605) que estava aqui. Ele causava a morte do sistema quando o browser caía.
 
     try:
-        logger.info(f"Iniciando navegador em: {browser_path if not is_windows else 'Padrão Windows'}")
+        logger.info(f"Iniciando navegador [{safe_id if not is_windows else 'Windows'}] em: {browser_path if not is_windows else 'Padrão'}")
         return ChromiumPage(addr_or_opts=options)
     except Exception as e:
-        logger.error(f"Falha crítca ao iniciar o navegador: {e}")
+        logger.error(f"Falha crítica ao iniciar o navegador: {e}")
         raise

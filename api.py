@@ -1,4 +1,3 @@
-# api.py
 import time
 import asyncio
 import logging
@@ -13,21 +12,29 @@ from DrissionPage.errors import PageDisconnectedError
 
 logger = logging.getLogger("cloudflare-bypass.api")
 
-# Dicionário para armazenar navegadores e seus contadores de uso
-# Estrutura: { 'default': {'browser': obj, 'count': 0}, 'proxy:123': {'browser': obj, 'count': 0} }
 browsers_data = {} 
 MAX_CONCURRENT_REQUESTS = 5
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 browser_lock = asyncio.Lock()
 MAX_REQUESTS_BEFORE_RESTART = 30
 
+# CORREÇÃO 3: Função para detectar o "Navegador Zumbi"
+def is_browser_alive(browser) -> bool:
+    """Tenta acessar o navegador para verificar se o processo no SO ainda está vivo."""
+    try:
+        # Tentar acessar a aba atual força uma comunicação com o CDP do Chrome.
+        # Se o processo morreu, isso vai lançar uma exceção.
+        _ = browser.tab
+        return True
+    except Exception:
+        return False
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Inicia o navegador padrão
     logger.info("Iniciando navegador padrão...")
     try:
-        # Executa em thread para não bloquear o startup se demorar muito
-        default_browser = await asyncio.to_thread(create_browser)
+        # Passa o instance_id 'default'
+        default_browser = await asyncio.to_thread(create_browser, instance_id='default')
         browsers_data['default'] = {'browser': default_browser, 'count': 0}
         logger.info("Navegador padrão pronto.")
     except Exception as e:
@@ -36,52 +43,62 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Encerra todos os navegadores
     logger.info("Encerrando todos os navegadores...")
     for key, data in list(browsers_data.items()):
         browser = data['browser']
         if browser:
             try:
                 await asyncio.to_thread(browser.quit)
-                logger.info(f"Navegador '{key}' fechado.")
             except Exception as e:
-                logger.error(f"Erro ao fechar navegador '{key}': {e}")
+                pass
     browsers_data.clear()
 
-app = FastAPI(title="Cloudflare Bypass API", version="2.1.1", lifespan=lifespan)
+app = FastAPI(title="Cloudflare Bypass API", version="2.1.2", lifespan=lifespan)
 
 async def get_browser(proxy: str = None):
-    """
-    Retorna um navegador pronto para uso.
-    """
     key = proxy if proxy else 'default'
     
-    # Se não existe ou o navegador morreu, cria um novo
-    async with browser_lock: # <--- Garante que apenas UM browser seja criado por vez
+    async with browser_lock:
+        # 1. Verifica se existe e não é None
+        if key in browsers_data and browsers_data[key]['browser'] is not None:
+            
+            # CORREÇÃO 4: Verifica se o processo do SO está realmente vivo
+            if not is_browser_alive(browsers_data[key]['browser']):
+                logger.warning(f"Detectado navegador Zumbi na chave '{key}'. Limpando...")
+                try:
+                    await asyncio.to_thread(browsers_data[key]['browser'].quit)
+                except Exception:
+                    pass
+                # Força a virar None para cair no bloco de criação abaixo
+                browsers_data[key]['browser'] = None
+
+        # 2. Cria um novo se precisar (se for novo ou se o zumbi foi limpo acima)
         if key not in browsers_data or browsers_data[key]['browser'] is None:
             logger.info(f"Criando navegador para: {key}")
             try:
-                new_browser = await asyncio.to_thread(create_browser, proxy=proxy)
+                # Passa o instance_id para o browser.py isolar os arquivos
+                new_browser = await asyncio.to_thread(create_browser, proxy=proxy, instance_id=key)
                 browsers_data[key] = {'browser': new_browser, 'count': 0}
             except Exception as e:
                 logger.error(f"Erro ao criar navegador: {e}")
                 raise HTTPException(status_code=400, detail=f"Erro ao iniciar browser: {e}")
 
-    browser_info = browsers_data[key]
-    
-    # Lógica de reinício preventivo
-    if browser_info['count'] >= MAX_REQUESTS_BEFORE_RESTART:
-        logger.info(f"Reiniciando navegador para {key} (limite de {MAX_REQUESTS_BEFORE_RESTART} atingido).")
-        try:
-            await asyncio.to_thread(browser_info['browser'].quit)
-        except:
-            pass # Ignora erros ao fechar o antigo
-        
-        try:
-            new_browser = await asyncio.to_thread(create_browser, proxy=proxy)
-            browsers_data[key] = {'browser': new_browser, 'count': 0}
-        except Exception as e:
-            raise HTTPException(status_code=503, detail="Falha ao reiniciar navegador")
+        # 3. Lógica de reinício preventivo
+        if browsers_data[key]['count'] >= MAX_REQUESTS_BEFORE_RESTART:
+            logger.info(f"Reiniciando navegador para {key} (limite atingido).")
+            try:
+                await asyncio.to_thread(browsers_data[key]['browser'].quit)
+            except:
+                pass
+            
+            # CORREÇÃO 5: Pausa vital no Linux. Dá tempo do SO liberar a porta e o arquivo .lock
+            await asyncio.sleep(0.5) 
+            
+            try:
+                new_browser = await asyncio.to_thread(create_browser, proxy=proxy, instance_id=key)
+                browsers_data[key] = {'browser': new_browser, 'count': 0}
+            except Exception as e:
+                raise HTTPException(status_code=503, detail="Falha ao reiniciar navegador")
 
     return browsers_data[key]
 
@@ -95,15 +112,13 @@ async def solver_endpoint(request: ClientRequest):
         try:
             logger.info("Processando requisição", extra={'extra_fields': {'url': request.url}})
             
-            # Obtém a instância do navegador de forma segura
             browser_data = await get_browser(request.proxy)
             browser = browser_data['browser']
             
-            # Cria a nova aba para a requisição atual
             tab = await asyncio.to_thread(browser.new_tab)
             
             await asyncio.to_thread(tab.get, request.url)
-            await asyncio.sleep(1.0) # Aguarda renderização de scripts
+            await asyncio.sleep(1.0)
 
             bypasser = CloudflareBypasserEvolved(tab)
             
@@ -135,7 +150,6 @@ async def solver_endpoint(request: ClientRequest):
             except Exception:
                 pass
 
-            # Incrementa o contador de uso com segurança
             async with browser_lock:
                 key = request.proxy if request.proxy else 'default'
                 if key in browsers_data:
@@ -162,14 +176,18 @@ async def solver_endpoint(request: ClientRequest):
                 try:
                     await asyncio.to_thread(tab.close)
                 except Exception as e:
-                    logger.warning(f"Erro ao fechar tab: {e}")
+                    pass
 
 @app.get("/health")
 async def health():
-    # Acesso seguro ao browser default
-    default_browser = browsers_data.get('default', {}).get('browser')
+    default_data = browsers_data.get('default', {})
+    default_browser = default_data.get('browser')
+    
+    # CORREÇÃO 6: O health agora usa a mesma lógica para não mentir que está "connected"
+    is_alive = is_browser_alive(default_browser) if default_browser else False
+    
     return {
         "status": "ok",
-        "browser": "connected" if default_browser else "disconnected",
+        "browser": "connected" if is_alive else "disconnected",
         "platform": platform.system()
     }
