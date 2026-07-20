@@ -95,18 +95,15 @@ async def solver_endpoint(request: ClientRequest):
         try:
             logger.info("Processando requisição", extra={'extra_fields': {'url': request.url}})
             
-            # Obtém o browser (já com lógica de count e to_thread)
+            # Obtém a instância do navegador de forma segura
             browser_data = await get_browser(request.proxy)
             browser = browser_data['browser']
             
-            # Incrementa o contador de uso
-            browsers_data[request.proxy if request.proxy else 'default']['count'] += 1
-
-            # Executa operações síncronas em threads separadas
+            # Cria a nova aba para a requisição atual
             tab = await asyncio.to_thread(browser.new_tab)
             
             await asyncio.to_thread(tab.get, request.url)
-            await asyncio.sleep(0.5) # Usar asyncio.sleep
+            await asyncio.sleep(1.0) # Aguarda renderização de scripts
 
             bypasser = CloudflareBypasserEvolved(tab)
             
@@ -115,7 +112,6 @@ async def solver_endpoint(request: ClientRequest):
                 await asyncio.to_thread(tab.get, request.url)
                 await asyncio.sleep(0.5)
 
-            # O bypass é a parte mais pesada
             success = await asyncio.to_thread(bypasser.bypass)
             
             if not success:
@@ -126,12 +122,9 @@ async def solver_endpoint(request: ClientRequest):
             
             turnstile_token = None
             try:
-                # Ele é síncrono, então to_thread é ideal, mas como é rápido e retorna erro rápido,
-                # podemos tentar direto se tivermos cuidado, mas to_thread é mais seguro.
-                # Aqui usei um wrapper para pegar o elemento com timeout curto
                 def get_token():
                     try:
-                        token_input = tab.ele("input[name='cf-turnstile-response']", timeout=2)
+                        token_input = tab.ele("input[name='cf-turnstile-response']", timeout=3)
                         if token_input:
                             return token_input.attr("value")
                     except:
@@ -142,8 +135,12 @@ async def solver_endpoint(request: ClientRequest):
             except Exception:
                 pass
 
-            logger.info("Requisição concluída com sucesso!")
-            
+            # Incrementa o contador de uso com segurança
+            async with browser_lock:
+                key = request.proxy if request.proxy else 'default'
+                if key in browsers_data:
+                    browsers_data[key]['count'] += 1
+
             return ClientResponse(
                 status="ok",
                 solution=Solution(
@@ -159,15 +156,11 @@ async def solver_endpoint(request: ClientRequest):
             raise
         except Exception as e:
             logger.error(f"Erro ao processar requisição: {e}")
-            # Aqui você poderia verificar se o erro foi de desconexão e resetar o browser
-            # Ex: if isinstance(e, PageDisconnectedError): marcar browser como morto
             raise HTTPException(status_code=500, detail=str(e))
         finally:
             if tab:
                 try:
                     await asyncio.to_thread(tab.close)
-                except PageDisconnectedError:
-                    logger.debug("Tab já estava desconectada ao tentar fechar.")
                 except Exception as e:
                     logger.warning(f"Erro ao fechar tab: {e}")
 

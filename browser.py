@@ -14,7 +14,9 @@ def create_browser(proxy: str = None, headless: bool = False):
     options.set_argument("--no-sandbox")
     options.set_argument("--disable-setuid-sandbox")
     options.set_argument("--disable-dev-shm-usage") # Crucial para VPS com pouca RAM
-    options.set_argument("--disable-gpu")
+    options.set_argument("--enable-webgl")
+    options.set_argument("--use-gl=angle")
+    options.set_argument("--use-angle=swiftshader")
     
     # Desativa telemetria e checagens de CPU que falham em containers
     options.set_argument("--disable-logging")
@@ -27,7 +29,7 @@ def create_browser(proxy: str = None, headless: bool = False):
 # --- 2. CONFIGURAÇÃO DE SISTEMA OPERACIONAL ---
     if is_windows:
         logger.info("Executando no Windows")
-        options.headless(True)
+        options.headless(False)
         options.auto_port()
     else:
         logger.info("Executando no Linux (Docker/WSL)")
