@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=UTF-8
 
-# 1. Dependências do sistema + suporte a OpenGL/Mesa para WebGL
+# 1. Dependências do sistema + Suporte OpenGL/Mesa atualizado para Debian Trixie
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg2 \
@@ -24,7 +24,8 @@ RUN apt-get update && apt-get install -y \
     libpango-1.0-0 \
     libcairo2 \
     fonts-liberation \
-    libgl1-mesa-glx \
+    libgl1 \
+    libglx-mesa0 \
     libgl1-mesa-dri \
     mesa-utils \
     && rm -rf /var/lib/apt/lists/*
