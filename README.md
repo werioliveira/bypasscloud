@@ -181,6 +181,34 @@ docker-compose up -d
 ```
 > A API ficará acessível em `http://localhost:8000`.
 
+### 🌐 Usando proxy de dentro do container
+
+Dentro do container, `127.0.0.1` e `localhost` apontam para o **próprio container**, e não para a sua máquina. Se o proxy roda no host, use `host.docker.internal`:
+
+```json
+{
+  "cmd": "request.get",
+  "url": "https://sitecomcaptcha.com",
+  "proxy": "http://host.docker.internal:8080"
+}
+```
+
+- ✅ `127.0.0.1`/`localhost` são remapeados automaticamente para `host.docker.internal` (desative com `PROXY_NO_REMAP=1`).
+- ✅ Proxies com usuário/senha (`http://user:pass@host:porta`) são autenticados via interceptor CDP — o Chrome ignora credenciais no `--proxy-server` (o curl envia sozinho, o Chrome não).
+- ✅ Em proxies `socks5`, o DNS é resolvido pelo proxy (equivale ao `socks5h` do curl).
+- 💡 Se o proxy usa whitelist de IP, libere o **IP público de saída da sua internet** (é por ele que o container chega ao proxy).
+
+### ⚡ Concorrência e pré-aquecimento
+
+- Cada chave de proxy tem seu **próprio lock**: requests com proxy e sem proxy (ou proxies diferentes) rodam **em paralelo**, cada uma no seu navegador.
+- O navegador sem proxy é aberto no startup. Para manter também navegadores com proxy sempre abertos, use a env `PREWARM_PROXIES` (separados por vírgula):
+
+```bash
+PREWARM_PROXIES=http://172.17.0.1:8989 docker-compose up -d
+```
+
+- O reinício preventivo (a cada 30 requisições) só acontece quando não há abas em uso, então nenhuma requisição em andamento é interrompida.
+
 ---
 
 ## ⚙️ Configuração Avançada

@@ -1,22 +1,52 @@
 import time
 import asyncio
 import logging
+import os
 import platform
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from models import ClientRequest, ClientResponse, Solution
-from utils import is_safe_url
-from bypasser import CloudflareBypasserEvolved
-from browser import create_browser
+from utils import is_safe_url, find_navigation_error
+from bypasser import CloudflareBypasserEvolved, AccessDeniedException
+from browser import create_browser, parse_proxy, install_proxy_auth
 from DrissionPage.errors import PageDisconnectedError
 
 logger = logging.getLogger("cloudflare-bypass.api")
 
-browsers_data = {} 
+browsers_data = {}
+key_locks: dict = {}  # um lock POR proxy: requests de proxies diferentes rodam em paralelo
 MAX_CONCURRENT_REQUESTS = 5
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-browser_lock = asyncio.Lock()
 MAX_REQUESTS_BEFORE_RESTART = 30
+
+# Navegadores com proxy abertos já no startup (separados por vírgula).
+# Ex.: PREWARM_PROXIES=http://172.17.0.1:8989,socks5://10.0.0.2:1080
+PREWARM_PROXIES = [p.strip() for p in os.getenv('PREWARM_PROXIES', '').split(',') if p.strip()]
+
+
+def _get_key_lock(key: str) -> asyncio.Lock:
+    """Retorna (criando se preciso) o lock da chave de proxy."""
+    lock = key_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        key_locks[key] = lock
+    return lock
+
+
+def _canonical_key(proxy: str = None) -> str:
+    """Chave canônica do navegador: 'default' ou 'scheme://host:porta'.
+
+    Garante que 'http://x:8989', 'x:8989' e 'http://x:8989/' usem o MESMO
+    navegador (e o mesmo lock), inclusive o pré-aquecido por PREWARM_PROXIES.
+    """
+    try:
+        info = parse_proxy(proxy)
+    except ValueError:
+        # Proxy malformado: usa a string crua como chave; get_browser vai
+        # revalidar e responder 400 com a mensagem adequada.
+        return str(proxy).strip() if proxy and str(proxy).strip() else 'default'
+    return info['server'] if info else 'default'
+
 
 # CORREÇÃO 3: Função para detectar o "Navegador Zumbi"
 def is_browser_alive(browser) -> bool:
@@ -29,17 +59,32 @@ def is_browser_alive(browser) -> bool:
     except Exception:
         return False
 
+
+async def _start_browser(proxy: str = None):
+    """Cria e registra um navegador (com ou sem proxy). Não lança exceção."""
+    key = _canonical_key(proxy)
+    try:
+        pinfo = parse_proxy(proxy)
+        browser = await asyncio.to_thread(create_browser, proxy=proxy, instance_id=key)
+        browsers_data[key] = {'browser': browser, 'count': 0, 'inflight': 0, 'proxy_auth': pinfo}
+        logger.info(f"Navegador pronto: {key}")
+    except Exception as e:
+        logger.error(f"Erro ao iniciar navegador [{key}]: {e}")
+        browsers_data[key] = {'browser': None, 'count': 0, 'inflight': 0, 'proxy_auth': None}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Iniciando navegador padrão...")
-    try:
-        # Passa o instance_id 'default'
-        default_browser = await asyncio.to_thread(create_browser, instance_id='default')
-        browsers_data['default'] = {'browser': default_browser, 'count': 0}
-        logger.info("Navegador padrão pronto.")
-    except Exception as e:
-        logger.error(f"Erro ao iniciar navegador padrão: {e}")
-        browsers_data['default'] = {'browser': None, 'count': 0}
+    # Sem proxy: sempre pré-aquecido no startup
+    logger.info("Iniciando navegador padrão (sem proxy)...")
+    await _start_browser(None)
+
+    # Com proxy: abre os navegadores listados em PREWARM_PROXIES em paralelo.
+    # Assim a 1ª requisição de cada proxy não paga o custo de abrir o Chrome
+    # e requests com proxy e sem proxy já nascem em navegadores separados.
+    if PREWARM_PROXIES:
+        logger.info(f"Pré-aquecendo navegadores com proxy: {PREWARM_PROXIES}")
+        await asyncio.gather(*[_start_browser(p) for p in PREWARM_PROXIES])
 
     yield
 
@@ -56,51 +101,65 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Cloudflare Bypass API", version="2.1.2", lifespan=lifespan)
 
 async def get_browser(proxy: str = None):
-    key = proxy if proxy else 'default'
-    
-    async with browser_lock:
-        # 1. Verifica se existe e não é None
-        if key in browsers_data and browsers_data[key]['browser'] is not None:
-            
-            # CORREÇÃO 4: Verifica se o processo do SO está realmente vivo
-            if not is_browser_alive(browsers_data[key]['browser']):
-                logger.warning(f"Detectado navegador Zumbi na chave '{key}'. Limpando...")
-                try:
-                    await asyncio.to_thread(browsers_data[key]['browser'].quit)
-                except Exception:
-                    pass
-                # Força a virar None para cair no bloco de criação abaixo
-                browsers_data[key]['browser'] = None
+    """Retorna os dados do navegador da chave (proxy ou 'default').
 
-        # 2. Cria um novo se precisar (se for novo ou se o zumbi foi limpo acima)
-        if key not in browsers_data or browsers_data[key]['browser'] is None:
+    - Lock POR chave: requisições de proxies diferentes rodam em paralelo.
+    - 'inflight' conta as abas em uso; o reinício preventivo só acontece com
+      zero abas em voo, para nunca matar a aba de outra requisição.
+    """
+    key = _canonical_key(proxy)
+
+    async with _get_key_lock(key):
+        data = browsers_data.get(key)
+
+        # 1. Zumbi: o objeto existe, mas o processo do SO morreu
+        if data and data['browser'] is not None and not is_browser_alive(data['browser']):
+            logger.warning(f"Detectado navegador Zumbi na chave '{key}'. Limpando...")
+            try:
+                await asyncio.to_thread(data['browser'].quit)
+            except Exception:
+                pass
+            data['browser'] = None
+
+        # 2. Cria se for a primeira vez da chave ou se o zumbi foi limpo
+        if data is None or data['browser'] is None:
             logger.info(f"Criando navegador para: {key}")
             try:
+                # parse_proxy valida/normaliza o proxy (pode levantar ValueError)
+                pinfo = parse_proxy(proxy)
                 # Passa o instance_id para o browser.py isolar os arquivos
                 new_browser = await asyncio.to_thread(create_browser, proxy=proxy, instance_id=key)
-                browsers_data[key] = {'browser': new_browser, 'count': 0}
+                data = {'browser': new_browser, 'count': 0, 'inflight': 0, 'proxy_auth': pinfo}
+                browsers_data[key] = data
             except Exception as e:
                 logger.error(f"Erro ao criar navegador: {e}")
                 raise HTTPException(status_code=400, detail=f"Erro ao iniciar browser: {e}")
 
-        # 3. Lógica de reinício preventivo
-        if browsers_data[key]['count'] >= MAX_REQUESTS_BEFORE_RESTART:
-            logger.info(f"Reiniciando navegador para {key} (limite atingido).")
-            try:
-                await asyncio.to_thread(browsers_data[key]['browser'].quit)
-            except:
-                pass
-            
-            # CORREÇÃO 5: Pausa vital no Linux. Dá tempo do SO liberar a porta e o arquivo .lock
-            await asyncio.sleep(0.5) 
-            
-            try:
-                new_browser = await asyncio.to_thread(create_browser, proxy=proxy, instance_id=key)
-                browsers_data[key] = {'browser': new_browser, 'count': 0}
-            except Exception as e:
-                raise HTTPException(status_code=503, detail="Falha ao reiniciar navegador")
+        # 3. Reinício preventivo (recicla memória/estado do Chrome) —
+        #    apenas quando nenhuma aba está em uso no navegador.
+        if data['count'] >= MAX_REQUESTS_BEFORE_RESTART:
+            if data['inflight'] == 0:
+                logger.info(f"Reiniciando navegador para {key} (limite atingido).")
+                try:
+                    await asyncio.to_thread(data['browser'].quit)
+                except Exception:
+                    pass
+                # CORREÇÃO 5: Pausa vital no Linux. Libera a porta e o arquivo .lock
+                await asyncio.sleep(0.5)
+                try:
+                    data['proxy_auth'] = parse_proxy(proxy)
+                    data['browser'] = await asyncio.to_thread(create_browser, proxy=proxy, instance_id=key)
+                    data['count'] = 0
+                except Exception as e:
+                    logger.error(f"Erro ao reiniciar navegador para {key}: {e}")
+                    raise HTTPException(status_code=503, detail="Falha ao reiniciar navegador")
+            else:
+                logger.info(f"Reinício de [{key}] adiado: {data['inflight']} aba(s) em uso.")
 
-    return browsers_data[key]
+        # 4. Marca uma aba em voo (decrementada no finally do endpoint)
+        data['inflight'] += 1
+
+    return data
 
 @app.post("/v1")
 async def solver_endpoint(request: ClientRequest):
@@ -109,16 +168,46 @@ async def solver_endpoint(request: ClientRequest):
 
     async with semaphore:
         tab = None
+        browser_data = None
         try:
             logger.info("Processando requisição", extra={'extra_fields': {'url': request.url}})
             
             browser_data = await get_browser(request.proxy)
             browser = browser_data['browser']
-            
+            pinfo = browser_data.get('proxy_auth')
+
             tab = await asyncio.to_thread(browser.new_tab)
-            
-            await asyncio.to_thread(tab.get, request.url)
-            await asyncio.sleep(1.0)
+
+            # Proxies com usuário/senha: o Chrome ignora credenciais no
+            # --proxy-server (o curl envia sozinho). Instalamos um interceptor
+            # CDP para responder ao 407, senão TODA request pelo proxy falha
+            # e a aba exibe página de erro.
+            if pinfo and pinfo.get('needs_auth'):
+                await asyncio.to_thread(
+                    install_proxy_auth, tab, pinfo['username'], pinfo['password']
+                )
+
+            loaded = await asyncio.to_thread(tab.get, request.url)
+            await asyncio.sleep(0.5)
+
+            # Detecta falha de navegação (ex.: proxy inacessível/407). Sem isso
+            # a API devolvia o HTML da página de erro do Chrome como se fosse
+            # sucesso e o cliente ficava sem dados e sem explicação.
+            final_url = tab.url or ''
+            err_code = find_navigation_error(tab.html or '')
+            if (not loaded) or final_url.startswith(('chrome-error://', 'about:')) or err_code:
+                hint = ''
+                if err_code in ('ERR_PROXY_CONNECTION_FAILED', 'ERR_TUNNEL_CONNECTION_FAILED', 'ERR_SOCKS_CONNECTION_FAILED'):
+                    hint = (" O Chrome nao alcancou o proxy. Dentro do container, "
+                            "'127.0.0.1'/'localhost' apontam para o proprio container; "
+                            "use 'host.docker.internal' ou o IP de rede do host.")
+                elif err_code in ('ERR_PROXY_AUTH_REQUESTED', 'ERR_INVALID_AUTH_CREDENTIALS'):
+                    hint = (" O proxy exige usuario/senha e a autenticacao falhou "
+                            "(o Chrome ignora credenciais na URL do proxy).")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Navegacao falhou ({err_code or 'sem resposta'}; url final: {final_url}).{hint}"
+                )
 
             bypasser = CloudflareBypasserEvolved(tab)
             
@@ -150,10 +239,9 @@ async def solver_endpoint(request: ClientRequest):
             except Exception:
                 pass
 
-            async with browser_lock:
-                key = request.proxy if request.proxy else 'default'
-                if key in browsers_data:
-                    browsers_data[key]['count'] += 1
+            # Sem lock: o event loop é single-thread e aqui não há await entre
+            # leitura e escrita. Só conta requisições bem-sucedidas.
+            browser_data['count'] += 1
 
             return ClientResponse(
                 status="ok",
@@ -166,12 +254,17 @@ async def solver_endpoint(request: ClientRequest):
                     turnstile_token=turnstile_token
                 )
             )
+        except AccessDeniedException as e:
+            # 403 = bloqueio real do Cloudflare (IP/proxy banido pela regra do site)
+            raise HTTPException(status_code=403, detail=str(e))
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Erro ao processar requisição: {e}")
             raise HTTPException(status_code=500, detail=str(e))
         finally:
+            if browser_data:
+                browser_data['inflight'] = max(0, browser_data['inflight'] - 1)
             if tab:
                 try:
                     await asyncio.to_thread(tab.close)

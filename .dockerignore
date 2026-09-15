@@ -1,0 +1,9 @@
+# Acelera o build e evita copiar lixo para a imagem
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+debug_html/
+*.md
+docker/

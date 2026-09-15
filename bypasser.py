@@ -1,4 +1,5 @@
 # bypasser.py
+import os
 import time
 import logging
 from DrissionPage import ChromiumPage
@@ -60,6 +61,17 @@ class CloudflareBypasserEvolved:
             logger.error("Acesso negado detectado via seletor CSS.")
             return True
         return False
+
+    def _dump_debug_html(self, tag: str):
+        """Salva o HTML atual para diagnóstico (mesmo formato dos page_*.html antigos)."""
+        try:
+            os.makedirs('debug_html', exist_ok=True)
+            fname = os.path.join('debug_html', f'{tag}_{time.strftime("%Y%m%d_%H%M%S")}.html')
+            with open(fname, 'w', encoding='utf-8') as f:
+                f.write(self.page.html or '')
+            logger.info(f"HTML salvo para diagnóstico: {fname}")
+        except Exception as e:
+            logger.debug(f"Falha ao salvar HTML de diagnóstico: {e}")
 
     # ---------- Interação precisa (estilo CloudflareBypassForScraping) ----------
     def locate_cf_turnstile_button(self):
@@ -145,8 +157,17 @@ class CloudflareBypasserEvolved:
 
     def bypass(self) -> bool:
         if self.is_access_denied():
-            logger.error("Acesso negado pela Cloudflare.")
-            raise AccessDeniedException("O IP foi bloqueado pela Cloudflare (Access Denied). Tente usar um proxy diferente.")
+            title = ''
+            try:
+                title = self.page.title or ''
+            except Exception:
+                pass
+            self._dump_debug_html('access_denied')
+            logger.error(f"Acesso negado pela Cloudflare. [url={self.page.url} | titulo={title!r}]")
+            raise AccessDeniedException(
+                "O IP foi bloqueado pela Cloudflare (Access Denied). Tente usar um proxy diferente. "
+                f"[url={self.page.url} | titulo={title!r}]"
+            )
 
         time.sleep(0.5)  # Pequena margem para o Cloudflare injetar seu HTML
 

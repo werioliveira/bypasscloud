@@ -7,5 +7,11 @@ services:
     ports:
       - "8000:8000"
     shm_size: '2gb'
+    extra_hosts:
+      # Garante que 'host.docker.internal' funcione também no Docker Engine Linux
+      - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
+      # Navegadores com proxy abertos já no startup (separados por vírgula).
+      # Ex.: PREWARM_PROXIES=http://172.17.0.1:8989
+      - PREWARM_PROXIES=${PREWARM_PROXIES:-}
