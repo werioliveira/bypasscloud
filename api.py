@@ -161,12 +161,36 @@ async def get_browser(proxy: str = None):
 
     return data
 
+async def _recycle_browser(proxy: str = None):
+    """Mata o navegador da chave (se existir) e cria outro do zero.
+
+    Usado quando o Chrome desconecta no meio de uma requisicao
+    (PageDisconnectedError): o objeto continua existindo, mas a conexao
+    CDP esta morta — is_browser_alive nao detecta todos os casos.
+    """
+    key = _canonical_key(proxy)
+    async with _get_key_lock(key):
+        data = browsers_data.get(key)
+        if data and data['browser'] is not None:
+            logger.warning(f"Reciclando navegador [{key}]...")
+            try:
+                await asyncio.to_thread(data['browser'].quit)
+            except Exception:
+                pass
+            data['browser'] = None
+    data = await get_browser(proxy)
+    data['inflight'] = 0  # nenhuma aba valida restou do navegador antigo
+    return data
+
+
 @app.post("/v1")
 async def solver_endpoint(request: ClientRequest):
     if not is_safe_url(request.url):
         raise HTTPException(status_code=400, detail="URL inválida")
 
-    async with semaphore:
+    # 2 tentativas: se o Chrome desconectar no meio (PageDisconnectedError),
+    # o navegador e reciclado e a requisicao e reprocessada automaticamente.
+    for tentativa in (1, 2):
         tab = None
         browser_data = None
         try:
@@ -198,9 +222,8 @@ async def solver_endpoint(request: ClientRequest):
             if (not loaded) or final_url.startswith(('chrome-error://', 'about:')) or err_code:
                 hint = ''
                 if err_code in ('ERR_PROXY_CONNECTION_FAILED', 'ERR_TUNNEL_CONNECTION_FAILED', 'ERR_SOCKS_CONNECTION_FAILED'):
-                    hint = (" O Chrome nao alcancou o proxy. Dentro do container, "
-                            "'127.0.0.1'/'localhost' apontam para o proprio container; "
-                            "use 'host.docker.internal' ou o IP de rede do host.")
+                    hint = (" O Chrome nao alcancou o proxy. Verifique se o tunel "
+                            "(cloudflared) e o app de proxy no celular estao de pe.")
                 elif err_code in ('ERR_PROXY_AUTH_REQUESTED', 'ERR_INVALID_AUTH_CREDENTIALS'):
                     hint = (" O proxy exige usuario/senha e a autenticacao falhou "
                             "(o Chrome ignora credenciais na URL do proxy).")
@@ -254,6 +277,17 @@ async def solver_endpoint(request: ClientRequest):
                     turnstile_token=turnstile_token
                 )
             )
+        except PageDisconnectedError as e:
+            # Chrome morreu no meio da requisicao (tunel/proxy caiu, OOM etc.).
+            # Recicla o navegador e tenta de novo; na 2a falha, erro claro.
+            logger.warning(f"Chrome desconectado (tentativa {tentativa}/2): {e}. Reciclando navegador...")
+            await _recycle_browser(request.proxy)
+            if tentativa == 2:
+                raise HTTPException(
+                    status_code=502,
+                    detail=("O navegador Chrome desconectou durante a requisicao e foi reciclado "
+                            f"automaticamente. Tente novamente em alguns segundos. ({e})")
+                )
         except AccessDeniedException as e:
             # 403 = bloqueio real do Cloudflare (IP/proxy banido pela regra do site)
             raise HTTPException(status_code=403, detail=str(e))

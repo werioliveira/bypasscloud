@@ -29,3 +29,13 @@ Thumbs.db
 # Configurações locais (se houver)
 .env
 local_config.py
+
+# Artefatos de teste/diagnóstico locais
+debug_html/
+payload_*.json
+teste_*.json
+teste_*.cmd
+teste_*.sh
+diag_*.sh
+tempo_*.txt
+resposta_teste*
