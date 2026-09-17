@@ -1,7 +1,8 @@
 # main.py
 import argparse
 import logging
-from logger import setup_logger
+from logger import setup_console_logger as setup_logger
+
 from api import app
 import uvicorn
 
