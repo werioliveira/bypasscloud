@@ -192,19 +192,24 @@ async def solver_endpoint(request: ClientRequest):
     if not is_safe_url(request.url):
         raise HTTPException(status_code=400, detail="URL inválida")
 
+    # Chave canônica do proxy (usada nos logs de todas as tentativas)
+    key = _canonical_key(request.proxy)
+
     # 2 tentativas: se o Chrome desconectar no meio (PageDisconnectedError),
-    # o navegador e reciclado e a requisicao e reprocessada automaticamente.
+    # o navegador é reciclado e a requisição é reprocessada automaticamente.
     for tentativa in (1, 2):
+        tentativa_hint = f" (tentativa {tentativa}/2)" if tentativa > 1 else ""
         tab = None
         browser_data = None
+        start_time = time.time()
         try:
             logger.info(
                 f"Processando requisição{tentativa_hint} | "
-                f"proxy={'SIM' if browser_data.get('proxy_auth') else 'NÃO'} | "
+                f"proxy={'SIM' if request.proxy else 'NÃO'} | "
                 f"chave={key} | "
                 f"url={request.url}"
             )
-            
+
             browser_data = await get_browser(request.proxy)
             browser = browser_data['browser']
             pinfo = browser_data.get('proxy_auth')
@@ -225,14 +230,6 @@ async def solver_endpoint(request: ClientRequest):
 
             # Detecta falha de navegação (ex.: proxy inacessível/407). Sem isso
             # a API devolvia o HTML da página de erro do Chrome como se fosse
-            logger.info(
-                f"Requisição concluída{tentativa_hint} | "
-                f"proxy={'SIM' if browser_data.get('proxy_auth') else 'NÃO'} | "
-                f"chave={key} | "
-                f"tempo={elapsed:.2f}s | "
-                f"url final={tab.url}"
-            )
-
             # sucesso e o cliente ficava sem dados e sem explicação.
             final_url = tab.url or ''
             err_code = find_navigation_error(tab.html or '')
@@ -250,20 +247,20 @@ async def solver_endpoint(request: ClientRequest):
                 )
 
             bypasser = CloudflareBypasserEvolved(tab)
-            
+
             if request.clear_session:
                 await asyncio.to_thread(bypasser.clear_session)
                 await asyncio.to_thread(tab.get, request.url)
                 await asyncio.sleep(0.5)
 
             success = await asyncio.to_thread(bypasser.bypass)
-            
+
             if not success:
                 raise HTTPException(status_code=408, detail="Falha ao burlar Cloudflare")
 
             cookies = await asyncio.to_thread(tab.cookies)
             json_safe_cookies = [dict(c) for c in cookies]
-            
+
             turnstile_token = None
             try:
                 def get_token():
@@ -274,7 +271,7 @@ async def solver_endpoint(request: ClientRequest):
                     except:
                         return None
                     return None
-                
+
                 turnstile_token = await asyncio.to_thread(get_token)
             except Exception:
                 pass
@@ -282,6 +279,15 @@ async def solver_endpoint(request: ClientRequest):
             # Sem lock: o event loop é single-thread e aqui não há await entre
             # leitura e escrita. Só conta requisições bem-sucedidas.
             browser_data['count'] += 1
+
+            elapsed = time.time() - start_time
+            logger.info(
+                f"Requisição concluída{tentativa_hint} | "
+                f"proxy={'SIM' if browser_data.get('proxy_auth') else 'NÃO'} | "
+                f"chave={key} | "
+                f"tempo={elapsed:.2f}s | "
+                f"url final={tab.url}"
+            )
 
             return ClientResponse(
                 status="ok",
