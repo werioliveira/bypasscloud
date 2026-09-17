@@ -8,10 +8,11 @@ from fastapi import FastAPI, HTTPException
 from models import ClientRequest, ClientResponse, Solution
 from utils import is_safe_url, find_navigation_error
 from bypasser import CloudflareBypasserEvolved, AccessDeniedException
-from browser import create_browser, parse_proxy, install_proxy_auth
+from browser import create_browser, parse_proxy, install_proxy_auth, mask_proxy
 from DrissionPage.errors import PageDisconnectedError
+from logger import setup_console_logger as setup_logger
 
-logger = logging.getLogger("cloudflare-bypass.api")
+logger = setup_logger("cloudflare-bypass.api")
 
 browsers_data = {}
 key_locks: dict = {}  # um lock POR proxy: requests de proxies diferentes rodam em paralelo
@@ -67,6 +68,8 @@ async def _start_browser(proxy: str = None):
         pinfo = parse_proxy(proxy)
         browser = await asyncio.to_thread(create_browser, proxy=proxy, instance_id=key)
         browsers_data[key] = {'browser': browser, 'count': 0, 'inflight': 0, 'proxy_auth': pinfo}
+        logger.info(f"Proxy: {mask_proxy(pinfo) or 'SEM PROXY'}")
+        logger.info(f"Chave canônica do navegador: {key}")
         logger.info(f"Navegador pronto: {key}")
     except Exception as e:
         logger.error(f"Erro ao iniciar navegador [{key}]: {e}")
@@ -76,14 +79,15 @@ async def _start_browser(proxy: str = None):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Sem proxy: sempre pré-aquecido no startup
-    logger.info("Iniciando navegador padrão (sem proxy)...")
+    api_logger = setup_logger("cloudflare-bypass.api")
+    api_logger.info("Iniciando navegador padrão (sem proxy)...")
     await _start_browser(None)
 
     # Com proxy: abre os navegadores listados em PREWARM_PROXIES em paralelo.
     # Assim a 1ª requisição de cada proxy não paga o custo de abrir o Chrome
     # e requests com proxy e sem proxy já nascem em navegadores separados.
     if PREWARM_PROXIES:
-        logger.info(f"Pré-aquecendo navegadores com proxy: {PREWARM_PROXIES}")
+        api_logger.info(f"Pré-aquecendo navegadores com proxy: {PREWARM_PROXIES}")
         await asyncio.gather(*[_start_browser(p) for p in PREWARM_PROXIES])
 
     yield
@@ -194,7 +198,12 @@ async def solver_endpoint(request: ClientRequest):
         tab = None
         browser_data = None
         try:
-            logger.info("Processando requisição", extra={'extra_fields': {'url': request.url}})
+            logger.info(
+                f"Processando requisição{tentativa_hint} | "
+                f"proxy={'SIM' if browser_data.get('proxy_auth') else 'NÃO'} | "
+                f"chave={key} | "
+                f"url={request.url}"
+            )
             
             browser_data = await get_browser(request.proxy)
             browser = browser_data['browser']
@@ -216,6 +225,14 @@ async def solver_endpoint(request: ClientRequest):
 
             # Detecta falha de navegação (ex.: proxy inacessível/407). Sem isso
             # a API devolvia o HTML da página de erro do Chrome como se fosse
+            logger.info(
+                f"Requisição concluída{tentativa_hint} | "
+                f"proxy={'SIM' if browser_data.get('proxy_auth') else 'NÃO'} | "
+                f"chave={key} | "
+                f"tempo={elapsed:.2f}s | "
+                f"url final={tab.url}"
+            )
+
             # sucesso e o cliente ficava sem dados e sem explicação.
             final_url = tab.url or ''
             err_code = find_navigation_error(tab.html or '')
