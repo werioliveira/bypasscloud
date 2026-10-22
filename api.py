@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from models import ClientRequest, ClientResponse, Solution
 from utils import is_safe_url, find_navigation_error
 from bypasser import CloudflareBypasserEvolved, AccessDeniedException
-from browser import create_browser, parse_proxy, install_proxy_auth, mask_proxy
+from browser import create_browser, parse_proxy, install_proxy_auth, mask_proxy, apply_stealth
 from DrissionPage.errors import PageDisconnectedError
 from logger import setup_console_logger as setup_logger
 
@@ -215,6 +215,9 @@ async def solver_endpoint(request: ClientRequest):
             pinfo = browser_data.get('proxy_auth')
 
             tab = await asyncio.to_thread(browser.new_tab)
+
+            # Aplica scripts de stealth para mascarar automação (essencial em headless)
+            await asyncio.to_thread(apply_stealth, tab)
 
             # Proxies com usuário/senha: o Chrome ignora credenciais no
             # --proxy-server (o curl envia sozinho). Instalamos um interceptor

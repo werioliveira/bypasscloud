@@ -1,5 +1,6 @@
 # bypasser.py
 import os
+import random
 import time
 import logging
 from DrissionPage import ChromiumPage
@@ -88,30 +89,52 @@ class CloudflareBypasserEvolved:
             return None
 
     def click_verify(self) -> bool:
+        # Tenta encontrar o botão Turnstile via shadow DOM
         button = self.locate_cf_turnstile_button()
         if button:
             try:
                 logger.info("Checkbox do Turnstile encontrado via shadow DOM. Clicando...")
                 button.click()
-                time.sleep(2)
-                return True
+                time.sleep(3)  # Aumentado de 2s para 3s - Cloudflare precisa de tempo para processar
+                # Verifica se o token foi gerado imediatamente
+                token_input = self.page.ele("input[name='cf-turnstile-response']", timeout=2)
+                if token_input and (token_input.attr("value") or ""):
+                    logger.info("Token Turnstile gerado após clique sombra.")
+                    return True
+                logger.info("Clique via shadow DOM realizado - aguardando token...")
             except Exception as e:
                 logger.debug(f"Falha ao clicar no checkbox Turnstile: {e}")
+        else:
+            logger.info("Botão Turnstile não encontrado via shadow DOM.")
 
-        logger.info("Botão Turnstile não encontrado. Tentando Tab+Space...")
+        # Fallback: simular usuário humano com Tab+Space
+        logger.info("Tentando Tab+Space...")
         try:
             body = self.page.ele('tag:body', timeout=1)
             if body:
                 body.click()
-                time.sleep(0.3)
-            for _ in range(1):
-                self.page.actions.key_down('TAB').wait(0.05).key_up('TAB')
-                self.page.actions.wait(0.2)
-            self.page.actions.wait(0.5)
-            self.page.actions.key_down('SPACE').wait(0.05).key_up('SPACE')
-            self.page.actions.wait(1.0)
-            time.sleep(2)
-            return True
+                time.sleep(0.3 + random.uniform(0, 0.5))  # Delay humano antes de Tab
+            for i in range(3):  # Tentativas múltiplas
+                # Tab with human-like delay
+                self.page.actions.key_down('TAB').wait(0.05 + random.uniform(0, 0.1)).key_up('TAB')
+                self.page.actions.wait(0.1 + random.uniform(0, 0.2))
+                # Space with human-like delay
+                self.page.actions.key_down('SPACE').wait(0.05 + random.uniform(0, 0.1)).key_up('SPACE')
+                self.page.actions.wait(1.0 + random.uniform(0, 0.5))
+                # Verifica se o token apareceu após o clique
+                token_input = self.page.ele("input[name='cf-turnstile-response']", timeout=1)
+                if token_input and (token_input.attr("value") or ""):
+                    logger.info("Token Turnstile obtido após Tab+Space!")
+                    return True
+                # Verifica se o desafio desapareceu
+                if not self.is_challenge_page():
+                    logger.info("Desafio sumiu após Tab+Space!")
+                    return True
+                # Delay humano entre tentativas
+                if i < 2:
+                    time.sleep(1 + random.uniform(0, 2))
+            logger.warning("Tab+Space não obteve token após 3 tentativas.")
+            return False
         except Exception as e:
             logger.debug(f"Falha no Tab+Space: {e}")
             return False
@@ -140,19 +163,35 @@ class CloudflareBypasserEvolved:
 
     def _wait_real_page(self, timeout: float = 20.0) -> bool:
         start = time.time()
+        progress_logged = {}
         while time.time() - start < timeout:
-            if self.is_challenge_page():
+            is_ch = self.is_challenge_page()
+            title_contains = self._title_contains(CHALLENGE_TITLES)
+            has_selectors = self._element_exists(self.all_challenge_selectors, timeout=0.3)
+            html_len = len(self.page.html or "")
+            
+            # Log de progresso a cada 5s
+            progress_key = int(time.time() - start)
+            if progress_key > 0 and progress_key % 5 == 0 and progress_key not in progress_logged:
+                logger.debug(f"_wait_real_page: is_challenge={is_ch}, title_has_challenge={title_contains}, has_selectors={has_selectors}, html_len={html_len}")
+                progress_logged[progress_key] = True
+            
+            if is_ch:
+                # Ainda no desafio - aguarde um pouco e continue
+                time.sleep(0.5)
+                continue
+            
+            if title_contains or has_selectors:
+                # Título ou seletores indicam desafio, mas is_challenge_page retornou False
+                # Isso pode acontecer em transição. Aguarde um pouco.
                 time.sleep(1)
                 continue
-            try:
-                self.page.wait.load_complete(timeout=8)
-            except Exception:
-                pass
-            if not self._title_contains(CHALLENGE_TITLES) and \
-               not self._element_exists(self.all_challenge_selectors, timeout=0.3):
-                return True
-            time.sleep(0.5)
-        logger.warning("Timeout aguardando página real após desafio.")
+            
+            # Nenhum sinal de desafio detectado
+            logger.info(f"_wait_real_page: desafio resolvido! (html_len={html_len}, decorrido={time.time()-start:.1f}s)")
+            return True
+        
+        logger.warning(f"Timeout aguardando página real após desafio. Último estado: is_challenge={self.is_challenge_page()}, title={self.page.title!r}")
         return False
 
     def bypass(self) -> bool:
@@ -211,37 +250,88 @@ class CloudflareBypasserEvolved:
             logger.info("Desafio Turnstile identificado.")
         else:
             # --- FASE 2: Under-attack / fingerprint — espera passiva prolongada ---
-            logger.info("Desafio padrão/under-attack detectado. Aguardando resolução automática (fingerprint) por até 30s...")
+            logger.info("Desafio padrão/under-attack detectado. Aguardando resolução automática (fingerprint) por até 45s...")
             passive_start = time.time()
-            while time.time() - passive_start < 30.0:
+            passive_logged = {}
+            while time.time() - passive_start < 45.0:
                 if self.is_access_denied():
                     return False
                 if not self.is_challenge_page():
                     logger.info("Desafio resolvido automaticamente (fingerprint).")
                     return True
-                # Log de progresso a cada 5s
-                if int(time.time() - passive_start) % 5 == 0:
-                    logger.debug(f"Aguardando fingerprint... ({int(time.time() - passive_start)}s)")
+                # Log de progresso a cada 10s
+                progress_key = int(time.time() - passive_start)
+                if progress_key > 0 and progress_key % 10 == 0 and progress_key not in passive_logged:
+                    title = self.page.title or ''
+                    html_len = len(self.page.html or "")
+                    logger.debug(f"Fingerprint waiting: {progress_key}s - is_challenge={self.is_challenge_page()}, title={title!r}, html_len={html_len}")
+                    passive_logged[progress_key] = True
                 time.sleep(1)
 
         # --- FASE 3: Tentativas ativas de clique/token ---
+        # Antes de tentar cliques, aguarde o elemento Turnstile aparecer (até 10s)
+        # Isso dá tempo para o desafio under-attack se resolver ou o Turnstile carregar
+        logger.info("Aguardando elemento Turnstile aparecer (até 10s)...")
+        turnstile_wait_start = time.time()
+        has_turnstile_wait = False
+        while time.time() - turnstile_wait_start < 10.0:
+            has_turnstile = self._element_exists(TURNSTILE_SELECTORS, timeout=1.0)
+            if not has_turnstile:
+                # Verifica se o desafio sumiu (fingerprint resolvesu)
+                if not self.is_challenge_page():
+                    logger.info("Desafio resolvido durante aguardo do Turnstile.")
+                    return True
+                time.sleep(0.5)
+                continue
+            logger.info("Elemento Turnstile detectado. Prosseguindo com bypass...")
+            has_turnstile_wait = True
+            break
+        if not has_turnstile_wait:
+            logger.warning("Timeout aguardando Turnstile - tentando bypass de qualquer maneira.")
+
+        # --- Diagnóstico pré-interação: verificar se a página realmente precisa de interação ---
+        # Se após 45s o título ainda indica desafio mas o HTML tem conteúdo real, pode ser que
+        # o fingerprint já tenha resolvido mas os indicadores persistem temporariamente
+        pre_click_title = self.page.title or ''
+        pre_click_html_len = len(self.page.html or '')
+        is_still_challenge = self.is_challenge_page()
+        
+        logger.debug(f"Pré-interação: title={pre_click_title!r}, html_len={pre_click_html_len}, is_challenge_page={is_still_challenge}")
+        
+        # Se o page HTML já tem conteúdo significativo (> 5000 bytes), o fingerprint pode ter resolvido
+        # Mesmo com título ainda mostrando "Just a moment", não devemos clicar se não precisar
+        if pre_click_html_len > 5000 and is_still_challenge:
+            logger.info(f"Página tem conteúdo significativo ({pre_click_html_len} bytes) mas título ainda indica desafio. "
+                       "Fingerprint pode ter resolvido - evitando interação desnecessária.")
+            # Verificar se o token já está presente
+            token_input = self.page.ele("input[name='cf-turnstile-response']", timeout=1)
+            if token_input and (token_input.attr("value") or ""):
+                logger.info("Token Turnstile já presente no HTML após fingerprint - desafio resolvido!")
+                return True
+            # Se há conteúdo real e token, considerar página carregada
+            if token_input:
+                logger.info("Desafio resolvido (fingerprint + conteúdo real). Retornando sucesso.")
+                return True
+            # Se não tem token nem conteúdo significativo após 45s, então tentar interação
+            logger.warning("Mesmo com conteúdo, ainda não há token - prosseguindo com bypass cuidadoso.")
+        
         for attempt in range(self.max_retries):
             logger.info(f"Tentativa de bypass {attempt + 1}/{self.max_retries}")
 
             if has_turnstile:
                 token = self.get_turnstile_token()
-                if token and self._wait_real_page():
+                if token and self._wait_real_page(timeout=25.0):
                     logger.info("Desafio Turnstile resolvido!")
                     return True
             else:
                 self.click_verify()
-                if self._wait_real_page():
+                if self._wait_real_page(timeout=25.0):
                     logger.info("Desafio resolvido!")
                     return True
 
             if self.is_access_denied():
                 return False
-            time.sleep(2)
+            time.sleep(3)
 
         logger.error(f"Falha após {self.max_retries} tentativas.")
         return False

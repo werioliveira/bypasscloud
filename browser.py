@@ -1,3 +1,4 @@
+import hashlib
 import os
 import platform
 import logging
@@ -74,6 +75,102 @@ def mask_proxy(info: dict | None) -> str:
     auth = f"{info['username']}:***@" if info['username'] else ''
     return f"{info['scheme']}://{auth}{info['host']}:{info['port']}"
 
+def apply_stealth(tab) -> bool:
+    """Injeta patches mínimos e coerentes para imitar um Chrome real.
+
+    Princípio: NÃO mascarar com valores falsos o que o Chrome real já
+    preenche corretamente (basta desviar). Patches aplicados:
+    - navigator.webdriver removido;
+    - plugins/mimeTypes realistas APENAS se o navegador reportar vazio;
+    - window.chrome completo;
+    - permissions.query corrigido (retornava objeto inválido);
+    - em headless, o token 'Headless' do UA é removido em runtime mantendo
+      a versão exata do binário (coerente com Sec-CH-UA).
+    Deve ser chamado antes de navegar para a URL alvo.
+    """
+    try:
+        driver = tab._driver
+        driver.run('Page.addScriptToEvaluateOnNewDocument', source='''
+            (() => {
+                // 1. webdriver: indefinido, como num Chrome real sem automação.
+                //    (--disable-blink-features=AutomationControlled já faz isso
+                //    nativamente; isto é redundância defensiva.)
+                try { delete Object.getPrototypeOf(navigator).webdriver; } catch (e) {}
+                try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined, configurable: true}); } catch (e) {}
+
+                // 2. plugins: lista realista do Chrome desktop (PDF viewer),
+                //    com length/item/namedItem coerentes. Só intervenho se
+                //    vazio (headless); um Chrome headed já tem plugins reais.
+                if (navigator.plugins.length === 0) {
+                    const pdfMimes = [
+                        {type: 'application/pdf',       suffixes: 'pdf'},
+                        {type: 'text/pdf',              suffixes: 'pdf'},
+                        {type: 'application/x-google-chrome-pdf', suffixes: 'pdf'},
+                    ];
+                    const names = [
+                        ['Chrome PDF Viewer',   'Portable Document Format'],
+                        ['Chromium PDF Viewer', 'Portable Document Format'],
+                        ['Microsoft Edge PDF Viewer', 'Portable Document Format'],
+                        ['WebKit built-in PDF', 'Portable Document Format'],
+                    ];
+                    const plugins = names.map(([name, description]) => {
+                        const p = {name, description, filename: 'internal-pdf-viewer', length: pdfMimes.length};
+                        pdfMimes.forEach((m, i) => p[i] = {type: m.type, suffixes: m.suffixes, description, plugins: null});
+                        return p;
+                    });
+                    plugins.item = (i) => plugins[i] || null;
+                    plugins.namedItem = (n) => plugins.find(p => p.name === n) || null;
+                    Object.defineProperty(navigator, 'plugins', {get: () => plugins, configurable: true});
+                    const mimes = pdfMimes;
+                    mimes.item = (i) => mimes[i] || null;
+                    mimes.namedItem = (n) => mimes.find(m => m.type === n) || null;
+                    Object.defineProperty(navigator, 'mimeTypes', {get: () => mimes, configurable: true});
+                }
+
+                // 3. window.chrome existe em navegadores reais
+                if (!window.chrome) {
+                    window.chrome = {app: {isInstalled: false}, runtime: {}, csi: () => {}, loadTimes: () => {}};
+                }
+
+                // 4. permissions.query: Estado real (o patch anterior retornava
+                //    um objeto inválido, {state: NotificationPermission}, que
+                //    a própria Cloudflare podia notar como valor inconsistente).
+                const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+                if (originalQuery) {
+                    window.navigator.permissions.query = (parameters) => (
+                        parameters && parameters.name === 'notifications'
+                            ? Promise.resolve({state: Notification.permission, onchange: null})
+                            : originalQuery(parameters)
+                    );
+                }
+            })();
+        ''')
+        logger.debug("Scripts de stealth injetados via CDP.")
+
+        # 5. UA coerente em headless: token HeadlessChrome → Chrome, mantendo a
+        #    versão EXATA do binário (discrepância UA ↔ Sec-CH-UA é o que
+        #    derrubava o bypass antes). Em headed este UA não contém 'Headless'
+        #    e nada é alterado.
+        try:
+            res = driver.run('Runtime.evaluate', expression='navigator.userAgent', returnByValue=True)
+            ua = (res.get('result') or {}).get('value') if isinstance(res, dict) else None
+            if ua and 'Headless' in ua:
+                clean_ua = ua.replace('Headless', '')
+                driver.run(
+                    'Network.setUserAgentOverride',
+                    userAgent=clean_ua,
+                    acceptLanguage='pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.3',
+                )
+                logger.info(f"User-agent de headless limpo (versão real preservada): {clean_ua}")
+        except Exception as e:
+            logger.debug(f"Não foi possível ajustar UA de headless: {e}")
+
+        return True
+    except Exception as e:
+        logger.debug(f"Falha ao injetar scripts de stealth: {e}")
+        return False
+
+
 def install_proxy_auth(tab, username: str, password: str) -> bool:
     """Instala um interceptor CDP para responder ao desafio 407 do proxy.
 
@@ -135,18 +232,37 @@ def create_browser(proxy=None, headless=None, instance_id: str = "default"):
     options.set_argument("--disable-features=Diagnostics")
 
     # --- 2. CONFIGURAÇÃO DE SISTEMA OPERACIONAL ---
+    # Isola o perfil por instância (evita o erro de SingletonLock do Chrome)
+    safe_id = str(instance_id).replace(":", "_").replace("/", "_")
+
+    want_headless = False
     if is_windows:
         logger.info("Executando no Windows")
         options.headless(False)
-        options.auto_port()
-        options.set_argument("--window-size=1920,1080")
+        # Janela maximizada como um Chrome real aberto pelo usuário
+        options.set_argument("--start-maximized")
+        # Porta FIXA por instância: auto_port() é incompatível com perfil
+        # customizado no DrissionPage 4.1.1.2 (set_user_data_path desativa o
+        # auto-port e limpa o endereço -> 'address.split(':')' explode
+        # 'not enough values to unpack'). Porta determinística via hash do id.
+        port = 9600 + (int(hashlib.md5(safe_id.encode()).hexdigest()[:8], 16) % 2000)
+        options.set_address(f"127.0.0.1:{port}")
+        # Perfil PERSISTENTE (igual ao Chrome real): cookies como cf_clearance
+        # sobrevivem entre execuções. Um desafio resolvido uma vez não é
+        # resolvido de novo, exatamente como no Chrome do desktop.
+        profile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "chrome_profiles", safe_id)
+        os.makedirs(profile_dir, exist_ok=True)
+        options.set_user_data_path(profile_dir)
     else:
         logger.info("Executando no Linux (Docker/WSL)")
         browser_path = os.getenv("CHROMIUM_PATH", "/usr/bin/google-chrome-stable")
         options.set_paths(browser_path=browser_path)
 
-        # auto_port() evita colisão de portas ao recriar navegadores
-        options.auto_port()
+        # Porta FIXA por instância (mesma restrição do Windows: auto_port()
+        # é incompatível com set_user_data_path no DrissionPage 4.1.1.2)
+        port = 9600 + (int(hashlib.md5(safe_id.encode()).hexdigest()[:8], 16) % 2000)
+        options.set_address(f"127.0.0.1:{port}")
         options.set_argument("--window-size=1920,1080")
         options.set_argument("--accept-lang=en-US")
 
@@ -159,8 +275,6 @@ def create_browser(proxy=None, headless=None, instance_id: str = "default"):
         if want_headless:
             options.set_argument("--headless=new")
 
-        # Isola o perfil por instância (evita o erro de SingletonLock do Chrome)
-        safe_id = str(instance_id).replace(":", "_").replace("/", "_")
         options.set_user_data_path(f"/tmp/drission_profiles/{safe_id}")
 
     # NOTA: removido o user-agent fixo (Chrome/125). O UA real do binário
@@ -169,6 +283,13 @@ def create_browser(proxy=None, headless=None, instance_id: str = "default"):
 
     # --- 3. ANTI-DETECÇÃO ---
     options.set_argument("--disable-blink-features=AutomationControlled")
+
+    # Argumentos que DESVIAM de um Chrome real foram removidos:
+    # - Sem user-agent fixo: UA fixo (Chrome/124) divergia do Sec-CH-UA do
+    #   binário real → inconsistência = sinal forte de bot → a Cloudflare
+    #   recarregava o desafio ATÉ MESMO com clique manual.
+    # - Sem --disable-features=IsolateOrigins,site-per-process nem
+    #   --disable-site-isolation-trials (traços não-padrão).
 
     # --- 4. PROXY ---
     info = parse_proxy(proxy)  # ValueError se inválido -> falha rápido com mensagem clara
