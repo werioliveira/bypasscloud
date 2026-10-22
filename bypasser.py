@@ -172,7 +172,7 @@ class CloudflareBypasserEvolved:
         time.sleep(0.5)  # Pequena margem para o Cloudflare injetar seu HTML
 
         start = time.time()
-        while time.time() - start < 6.0:
+        while time.time() - start < 10.0:
             if self.is_access_denied():
                 return False
 
@@ -200,6 +200,18 @@ class CloudflareBypasserEvolved:
         has_turnstile = self._element_exists(TURNSTILE_SELECTORS, timeout=0.5)
         if has_turnstile:
             logger.info("Desafio Turnstile identificado.")
+        else:
+            # Modo "under attack" / fingerprint: o desafio pode se resolver
+            # sozinho via JavaScript. Damos tempo antes de tentar cliques.
+            logger.info("Desafio padrão/under-attack detectado. Aguardando resolução automática (fingerprint)...")
+            passive_start = time.time()
+            while time.time() - passive_start < 15.0:
+                if self.is_access_denied():
+                    return False
+                if not self.is_challenge_page():
+                    logger.info("Desafio resolvido automaticamente (fingerprint).")
+                    return True
+                time.sleep(1)
 
         for attempt in range(self.max_retries):
             logger.info(f"Tentativa de bypass {attempt + 1}/{self.max_retries}")
@@ -217,7 +229,7 @@ class CloudflareBypasserEvolved:
 
             if self.is_access_denied():
                 return False
-            time.sleep(1)
+            time.sleep(2)
 
         logger.error(f"Falha após {self.max_retries} tentativas.")
         return False
