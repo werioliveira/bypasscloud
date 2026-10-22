@@ -184,12 +184,10 @@ def create_browser(proxy=None, headless=None, instance_id: str = "default"):
             )
 
     # --- 5. PERFORMANCE ---
-    # 'eager': tab.get() retorna quando o DOM está pronto (não espera todas as
-    # imagens/recursos). O bypasser faz polling próprio do estado da página,
-    # então a detecção/resolução de desafio não muda em nada.
-    # Feature-detect: versões antigas do DrissionPage podem não ter o método.
+    # Modo 'normal' (default) para garantir que JS do desafio under-attack carregue
+    # (eager pode impedir execução do JS da Cloudflare, deixando a página em branco).
     try:
-        options.set_load_mode("eager")
+        options.set_load_mode("normal")
     except Exception:
         pass
 

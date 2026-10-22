@@ -169,50 +169,62 @@ class CloudflareBypasserEvolved:
                 f"[url={self.page.url} | titulo={title!r}]"
             )
 
-        time.sleep(0.5)  # Pequena margem para o Cloudflare injetar seu HTML
+        # Aguarda o Cloudflare injetar o HTML do desafio (under-attack pode deixar página em branco)
+        time.sleep(1.0)
 
+        # --- FASE 1: Detecção inicial (até 12s) ---
         start = time.time()
-        while time.time() - start < 10.0:
+        while time.time() - start < 12.0:
             if self.is_access_denied():
                 return False
 
-            # Atalho seguro para páginas normais: se tem conteúdo e título OK
-            if len(self.page.html or "") > 500 and not self._title_contains(CHALLENGE_TITLES):
+            title = self.page.title or ''
+            html_len = len(self.page.html or "")
+
+            # Página em branco com título "Just a moment..." = under-attack / fingerprint
+            if html_len < 500 and self._title_contains(CHALLENGE_TITLES):
+                logger.info(f"Página em branco com título de desafio detectada (under-attack). Aguardando fingerprint... [titulo={title!r}]")
+                break
+
+            # Atalho seguro para páginas normais
+            if html_len > 500 and not self._title_contains(CHALLENGE_TITLES):
                 if not self._element_exists(
                     ['script[src*="/cdn-cgi/challenge-platform/"]'], timeout=0.5
                 ):
-                    # Confirmação dupla para evitar fechamento precoce
                     time.sleep(0.2)
                     if not self.is_challenge_page():
                         logger.info("Nenhum desafio detectado. Página carregada diretamente.")
                         return True
 
-            # Verificação completa (mais demorada) para capturar desafios reais
+            # Verificação completa para capturar desafios reais
             if self.is_challenge_page():
                 break
 
             time.sleep(0.3)
 
         if not self.is_challenge_page():
-            logger.info("Nenhum desafio detectado após espera curta.")
+            logger.info("Nenhum desafio detectado após espera inicial.")
             return True
 
         has_turnstile = self._element_exists(TURNSTILE_SELECTORS, timeout=0.5)
         if has_turnstile:
             logger.info("Desafio Turnstile identificado.")
         else:
-            # Modo "under attack" / fingerprint: o desafio pode se resolver
-            # sozinho via JavaScript. Damos tempo antes de tentar cliques.
-            logger.info("Desafio padrão/under-attack detectado. Aguardando resolução automática (fingerprint)...")
+            # --- FASE 2: Under-attack / fingerprint — espera passiva prolongada ---
+            logger.info("Desafio padrão/under-attack detectado. Aguardando resolução automática (fingerprint) por até 30s...")
             passive_start = time.time()
-            while time.time() - passive_start < 15.0:
+            while time.time() - passive_start < 30.0:
                 if self.is_access_denied():
                     return False
                 if not self.is_challenge_page():
                     logger.info("Desafio resolvido automaticamente (fingerprint).")
                     return True
+                # Log de progresso a cada 5s
+                if int(time.time() - passive_start) % 5 == 0:
+                    logger.debug(f"Aguardando fingerprint... ({int(time.time() - passive_start)}s)")
                 time.sleep(1)
 
+        # --- FASE 3: Tentativas ativas de clique/token ---
         for attempt in range(self.max_retries):
             logger.info(f"Tentativa de bypass {attempt + 1}/{self.max_retries}")
 

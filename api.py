@@ -227,6 +227,11 @@ async def solver_endpoint(request: ClientRequest):
 
             loaded = await asyncio.to_thread(tab.get, request.url)
             await asyncio.sleep(0.5)
+            # Garante que JS/resources do desafio under-attack carreguem (evita página em branco)
+            try:
+                await asyncio.to_thread(tab.wait.load_complete, timeout=10)
+            except Exception:
+                pass
 
             # Detecta falha de navegação (ex.: proxy inacessível/407). Sem isso
             # a API devolvia o HTML da página de erro do Chrome como se fosse
