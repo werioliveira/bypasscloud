@@ -1,4 +1,5 @@
 # bypasser.py
+import json
 import os
 import random
 import time
@@ -13,6 +14,32 @@ from config import (
     MAX_RETRIES,
 )
 
+# Snapshot leve do estado da página: UMA Runtime.evaluate por poll em vez de
+# 4-6 chamadas CDP (page.html serializa o DOM inteiro a cada consulta, o que
+# pesa muito numa VPS com CPU fraca). 'htmlLen' é calculado DENTRO do browser
+# (outerHTML.length), sem transferir o HTML por websocket.
+# Seletores são passados como array JSON (__SEL__) e unidos no JS com ','.
+# challengeScript: detecta APENAS scripts de desafio ATIVO (pasta h/ ou turnstile),
+# NÃO analytics/beacon (/cdn-cgi/challenge-platform/scripts/jsd/main.js).
+JS_STATE = (
+    "const d = document;"
+    "const st = {};"
+    "st.title = d.title || '';"
+    "st.htmlLen = d.documentElement ? d.documentElement.outerHTML.length : 0;"
+    # Scripts de desafio ativo: /cdn-cgi/challenge-platform/h/... ou turnstile
+    # Exclui analytics: /cdn-cgi/challenge-platform/scripts/jsd/main.js
+    'const cs = d.querySelector(\'script[src*="/cdn-cgi/challenge-platform/"]\');'
+    'st.challengeScript = cs && (cs.src.includes("/h/") || cs.src.includes("turnstile"));'
+    # __SEL__ será substituído por JSON array: ["sel1", "sel2", ...]
+    # No JS fazemos: __SEL__.join(",") para criar seletor composto válido
+    'st.suspect = !!d.querySelector(__SEL__.join(","));'
+    'const ti = d.querySelector(\'input[name="cf-turnstile-response"]\');'
+    "st.token = (ti && ti.value) || '';"
+    "st.turnstileInput = !!ti;"
+    "st.turnstileIframe = !!d.querySelector(\"iframe[src*='challenges.cloudflare.com']\");"
+    "return JSON.stringify(st);"
+)
+
 logger = logging.getLogger("cloudflare-bypass.bypasser")
 class AccessDeniedException(Exception):
     """Exceção levantada quando o acesso é bloqueado pela Cloudflare."""
@@ -24,6 +51,8 @@ class CloudflareBypasserEvolved:
         self.page = page
         self.max_retries = max_retries
         self.all_challenge_selectors = CHALLENGE_SELECTORS + TURNSTILE_SELECTORS
+        # Seletores como lista para JSON encoding no _page_state
+        self._js_selector = self.all_challenge_selectors
 
     # ---------- Helpers de detecção ----------
     def _title_contains(self, candidates: list[str]) -> bool:
@@ -42,17 +71,41 @@ class CloudflareBypasserEvolved:
         except Exception:
             return False
 
-    def is_challenge_page(self) -> bool:
-        # 1. Script do Cloudflare (infalível se presente)
-        if self._element_exists(['script[src*="/cdn-cgi/challenge-platform/"]'], timeout=1.0):
+    # ---------- Snapshot leve (VPS com CPU fraca) ----------
+    def _page_state(self) -> dict:
+        """Estado da página com UMA chamada JS (barato em CPU e I/O de CDP).
+
+        Substitui o padrão antigo (is_challenge_page + _title_contains +
+        _element_exists + page.html = 4-6 roundtrips com serialização DOM)
+        por uma única Runtime.evaluate a cada iteração. Um snapshot típico
+        tem ~80 bytes de resposta, contra dezenas de KB do page.html.
+        """
+        # Constrói o JS com o seletor como JSON array (evita problemas de aspas)
+        js = JS_STATE.replace('__SEL__', json.dumps(self._js_selector))
+        try:
+            raw = self.page.run_js(js)
+            if isinstance(raw, str):
+                return json.loads(raw)
+            return raw if isinstance(raw, dict) else {}
+        except Exception as e:
+            logger.warning(f"_page_state JS error: {e}")
+            return {}
+
+    def _state_is_challenge(self, st: dict) -> bool:
+        """Detecta desafio a partir do snapshot já obtido (sem novas consultas)."""
+        if st.get('challengeScript') or st.get('suspect'):
             return True
-        # 2. Título de desafio (português/inglês)
+        title = (st.get('title') or '').lower()
+        return any(t in title for t in CHALLENGE_TITLES)
+
+    def is_challenge_page(self) -> bool:
+        st = self._page_state()
+        if st:
+            return self._state_is_challenge(st)
+        # Fallback quando a chamada JS falha (mesma semântica do original)
         if self._title_contains(CHALLENGE_TITLES):
             return True
-        # 3. Seletores visuais (inclui .lds‑ring, iframe Turnstile, etc.)
-        if self._element_exists(self.all_challenge_selectors, timeout=1.5):
-            return True
-        return False
+        return self._element_exists(self.all_challenge_selectors, timeout=1.5)
 
     def is_access_denied(self) -> bool:
         if self._title_contains(ACCESS_DENIED_TITLES):
@@ -162,39 +215,70 @@ class CloudflareBypasserEvolved:
             return None
 
     def _wait_real_page(self, timeout: float = 20.0) -> bool:
+        """Espera a página real aparecer após o desafio (1 snapshot JS leve/iteração)."""
         start = time.time()
-        progress_logged = {}
+        positive_streak = 0
         while time.time() - start < timeout:
-            is_ch = self.is_challenge_page()
-            title_contains = self._title_contains(CHALLENGE_TITLES)
-            has_selectors = self._element_exists(self.all_challenge_selectors, timeout=0.3)
-            html_len = len(self.page.html or "")
-            
-            # Log de progresso a cada 5s
-            progress_key = int(time.time() - start)
-            if progress_key > 0 and progress_key % 5 == 0 and progress_key not in progress_logged:
-                logger.debug(f"_wait_real_page: is_challenge={is_ch}, title_has_challenge={title_contains}, has_selectors={has_selectors}, html_len={html_len}")
-                progress_logged[progress_key] = True
-            
-            if is_ch:
-                # Ainda no desafio - aguarde um pouco e continue
-                time.sleep(0.5)
+            try:
+                st = self._page_state()
+            except Exception:
+                time.sleep(1.0)
                 continue
-            
-            if title_contains or has_selectors:
-                # Título ou seletores indicam desafio, mas is_challenge_page retornou False
-                # Isso pode acontecer em transição. Aguarde um pouco.
-                time.sleep(1)
+
+            title = (st.get('title') or '').lower()
+            has_challenge_dom = st.get('challengeScript') or st.get('suspect')
+            challenge = (
+                has_challenge_dom
+                or any(t in title for t in CHALLENGE_TITLES)
+            )
+
+            html_len = st.get('htmlLen', 0)
+
+            # Fast-path: HTML grande (+5KB) E sem elementos de desafio no DOM = página real
+            if html_len > 5000 and not has_challenge_dom:
+                logger.info(
+                    f"_wait_real_page: página real detectada via HTML "
+                    f"(html_len={html_len}, decorrido={time.time() - start:.1f}s)"
+                )
+                return True
+
+            if challenge:
+                positive_streak = 0
+                time.sleep(1.0)
                 continue
-            
-            # Nenhum sinal de desafio detectado
-            logger.info(f"_wait_real_page: desafio resolvido! (html_len={html_len}, decorrido={time.time()-start:.1f}s)")
-            return True
-        
-        logger.warning(f"Timeout aguardando página real após desafio. Último estado: is_challenge={self.is_challenge_page()}, title={self.page.title!r}")
+
+            # 1 positive streak basta (era 2 = 2s mínimo)
+            if html_len > 500:
+                positive_streak += 1
+                if positive_streak >= 1:
+                    logger.info(
+                        f"_wait_real_page: página real detectada "
+                        f"(html_len={html_len}, decorrido={time.time() - start:.1f}s)"
+                    )
+                    return True
+            else:
+                positive_streak = 0
+
+            time.sleep(1.0)
+
+        last_title = ''
+        try:
+            last_title = self.page.title or ''
+        except Exception:
+            pass
+        logger.warning(f"Timeout aguardando página real após desafio. [titulo={last_title[:60]!r}]")
         return False
 
     def bypass(self) -> bool:
+        import time as _time
+        _bypass_start = _time.time()
+        _phase_start = _bypass_start
+        def _log_phase(name: str):
+            nonlocal _phase_start
+            now = _time.time()
+            logger.info(f"[TIMING] {name}: {now - _phase_start:.2f}s (total: {now - _bypass_start:.2f}s)")
+            _phase_start = now
+
         if self.is_access_denied():
             title = ''
             try:
@@ -208,67 +292,121 @@ class CloudflareBypasserEvolved:
                 f"[url={self.page.url} | titulo={title!r}]"
             )
 
+        _log_phase("INICIO bypass")
+
         # Aguarda o Cloudflare injetar o HTML do desafio (under-attack pode deixar página em branco)
         time.sleep(1.0)
 
-        # --- FASE 1: Detecção inicial (até 12s) ---
+        # --- FASE 1: Detecção inicial (até ~10s) — snapshot JS leve ---
+        _log_phase("FASE1 inicio")
         start = time.time()
-        while time.time() - start < 12.0:
+        blank_logged = False
+        while time.time() - start < 10.0:
             if self.is_access_denied():
                 return False
 
-            title = self.page.title or ''
-            html_len = len(self.page.html or "")
+            st = self._page_state()
+            st_challenge = self._state_is_challenge(st)
+            html_len = st.get('htmlLen', 0)
+            has_challenge_dom = st.get('challengeScript') or st.get('suspect')
 
-            # Página em branco com título "Just a moment..." = under-attack / fingerprint
-            if html_len < 500 and self._title_contains(CHALLENGE_TITLES):
-                logger.info(f"Página em branco com título de desafio detectada (under-attack). Aguardando fingerprint... [titulo={title!r}]")
+            # DEBUG: log valores a cada iteração
+            logger.info(f"FASE1 loop: html_len={html_len}, has_challenge_dom={has_challenge_dom}, st_challenge={st_challenge}, title={st.get('title')!r}, challengeScript={bool(st.get('challengeScript'))}, suspect={bool(st.get('suspect'))}")
+
+            # Página em branco com título de desafio = under-attack / fingerprint
+            if st_challenge and html_len < 500:
+                if not blank_logged:
+                    blank_logged = True
+                    logger.info(f"Página em branco com título de desafio (under-attack). Aguardando fingerprint... [titulo={st.get('title')!r}]")
+                time.sleep(1.0)
+                continue
+
+            # Fast-path: HTML grande (+5KB) E sem elementos de desafio no DOM = página real
+            # (título pode estar stale durante transição/redirect)
+            if html_len > 5000 and not has_challenge_dom:
+                logger.info(f"Página real detectada via HTML ({html_len} bytes) — ignorando título stale.")
+                return True
+
+            # Fast-path JSON/API: resposta pequena (>100 bytes) mas SEM indicadores de desafio NO DOM
+            # (evita esperar 10s em endpoints que retornam JSON direto)
+            # IMPORTANTE: usa has_challenge_dom (DOM real), NÃO st_challenge (inclui título)
+            if html_len > 100 and not has_challenge_dom:
+                logger.info(f"Resposta JSON/API detectada ({html_len} bytes) — sem desafio Cloudflare.")
+                return True
+
+            # Fallback original: HTML médio + sem desafio no DOM
+            if html_len > 2500 and not has_challenge_dom:
+                logger.info(f"Nenhum desafio detectado. Página carregada diretamente ({html_len} bytes).")
+                return True
+
+            # Se chegou aqui: ou página ainda carrega (html_len <= 2500)
+            # ou há indicadores de desafio NO DOM (has_challenge_dom)
+            # Em ambos os casos, há desafio ativo → quebrar para FASE 2/3
+            if has_challenge_dom or st_challenge:
                 break
 
-            # Atalho seguro para páginas normais
-            if html_len > 500 and not self._title_contains(CHALLENGE_TITLES):
-                if not self._element_exists(
-                    ['script[src*="/cdn-cgi/challenge-platform/"]'], timeout=0.5
-                ):
-                    time.sleep(0.2)
-                    if not self.is_challenge_page():
-                        logger.info("Nenhum desafio detectado. Página carregada diretamente.")
-                        return True
+            # Página em branco (html_len <= 2500) sem challenge DOM → aguarda carregar
+            time.sleep(0.5)
 
-            # Verificação completa para capturar desafios reais
-            if self.is_challenge_page():
-                break
-
-            time.sleep(0.3)
-
-        if not self.is_challenge_page():
+        # Loop de 10s expirou sem detectar desafio claro → verificação final leve
+        st = self._page_state()
+        if not (st.get('challengeScript') or st.get('suspect') or self._state_is_challenge(st)):
             logger.info("Nenhum desafio detectado após espera inicial.")
+            _log_phase("FASE1 fim - sem desafio")
             return True
+
+        _log_phase("FASE1 fim - desafio detectado")
 
         has_turnstile = self._element_exists(TURNSTILE_SELECTORS, timeout=0.5)
         if has_turnstile:
             logger.info("Desafio Turnstile identificado.")
+            _log_phase("Turnstile detectado")
         else:
-            # --- FASE 2: Under-attack / fingerprint — espera passiva prolongada ---
+            # --- FASE 2: Under-attack / fingerprint — espera passiva leve ---
+            _log_phase("FASE2 inicio")
             logger.info("Desafio padrão/under-attack detectado. Aguardando resolução automática (fingerprint) por até 45s...")
             passive_start = time.time()
-            passive_logged = {}
+            passive_key = -1
             while time.time() - passive_start < 45.0:
                 if self.is_access_denied():
                     return False
-                if not self.is_challenge_page():
+                st = self._page_state()
+                html_len = st.get('htmlLen', 0)
+                has_challenge_dom = st.get('challengeScript') or st.get('suspect')
+
+                # Fast-path: HTML grande (+5KB) E sem elementos de desafio no DOM
+                if html_len > 5000 and not has_challenge_dom:
+                    logger.info(f"Página real detectada via HTML ({html_len} bytes) — fingerprint resolvido.")
+                    return True
+
+                # Fallback original
+                if not self._state_is_challenge(st) and html_len > 500:
                     logger.info("Desafio resolvido automaticamente (fingerprint).")
                     return True
-                # Log de progresso a cada 10s
-                progress_key = int(time.time() - passive_start)
-                if progress_key > 0 and progress_key % 10 == 0 and progress_key not in passive_logged:
-                    title = self.page.title or ''
-                    html_len = len(self.page.html or "")
-                    logger.debug(f"Fingerprint waiting: {progress_key}s - is_challenge={self.is_challenge_page()}, title={title!r}, html_len={html_len}")
-                    passive_logged[progress_key] = True
-                time.sleep(1)
+
+                progress_key = int(time.time() - passive_start) // 10
+                if progress_key > passive_key:
+                    passive_key = progress_key
+                    logger.info(
+                        f"Aguardando fingerprint... [{int(time.time() - passive_start)}s | "
+                        f"titulo={(st.get('title') or '')[:40]!r} | html_len={html_len}]"
+                    )
+                time.sleep(1.0)
+
+        _log_phase("FASE2 fim - fast-path check")
+
+        # --- Fast-path pós-FASE 2: página já carregou sem Turnstile ---
+        # Se o fingerprint resolveu e não há Turnstile, NÃO espere 10s à toa.
+        st = self._page_state()
+        html_len = st.get('htmlLen', 0)
+        has_challenge_dom = st.get('challengeScript') or st.get('suspect')
+        if html_len > 5000 and not has_challenge_dom:
+            logger.info(f"Página real já carregada ({html_len} bytes) — pulando espera Turnstile (10s).")
+            _log_phase("FASE2 fast-path return")
+            return True
 
         # --- FASE 3: Tentativas ativas de clique/token ---
+        _log_phase("FASE3 inicio")
         # Antes de tentar cliques, aguarde o elemento Turnstile aparecer (até 10s)
         # Isso dá tempo para o desafio under-attack se resolver ou o Turnstile carregar
         logger.info("Aguardando elemento Turnstile aparecer (até 10s)...")
@@ -289,32 +427,22 @@ class CloudflareBypasserEvolved:
         if not has_turnstile_wait:
             logger.warning("Timeout aguardando Turnstile - tentando bypass de qualquer maneira.")
 
-        # --- Diagnóstico pré-interação: verificar se a página realmente precisa de interação ---
-        # Se após 45s o título ainda indica desafio mas o HTML tem conteúdo real, pode ser que
-        # o fingerprint já tenha resolvido mas os indicadores persistem temporariamente
-        pre_click_title = self.page.title or ''
-        pre_click_html_len = len(self.page.html or '')
-        is_still_challenge = self.is_challenge_page()
-        
-        logger.debug(f"Pré-interação: title={pre_click_title!r}, html_len={pre_click_html_len}, is_challenge_page={is_still_challenge}")
-        
-        # Se o page HTML já tem conteúdo significativo (> 5000 bytes), o fingerprint pode ter resolvido
-        # Mesmo com título ainda mostrando "Just a moment", não devemos clicar se não precisar
-        if pre_click_html_len > 5000 and is_still_challenge:
-            logger.info(f"Página tem conteúdo significativo ({pre_click_html_len} bytes) mas título ainda indica desafio. "
-                       "Fingerprint pode ter resolvido - evitando interação desnecessária.")
-            # Verificar se o token já está presente
-            token_input = self.page.ele("input[name='cf-turnstile-response']", timeout=1)
-            if token_input and (token_input.attr("value") or ""):
-                logger.info("Token Turnstile já presente no HTML após fingerprint - desafio resolvido!")
-                return True
-            # Se há conteúdo real e token, considerar página carregada
-            if token_input:
-                logger.info("Desafio resolvido (fingerprint + conteúdo real). Retornando sucesso.")
-                return True
-            # Se não tem token nem conteúdo significativo após 45s, então tentar interação
-            logger.warning("Mesmo com conteúdo, ainda não há token - prosseguindo com bypass cuidadoso.")
-        
+        # --- Diagnóstico pré-interação (snapshot leve; NÃO serializa DOM) ---
+        # Se o fingerprint já resolveu mas o título ainda mostra o desafio
+        # (transição/redirect), evitamos clique desnecessário que dispara refresh.
+        pre = self._page_state()
+        pre_challenge = self._state_is_challenge(pre)
+        pre_len = pre.get('htmlLen', 0)
+        pre_token = pre.get('token') or ''
+        logger.debug(f"Pré-interação: title={pre.get('title')!r}, html_len={pre_len}, challenge={pre_challenge}, token={bool(pre_token)}")
+
+        if pre_token:
+            logger.info("Token Turnstile já presente após fingerprint - desafio resolvido!")
+            return True
+        if pre_len > 5000 and not pre_challenge:
+            logger.info(f"Página real já carregada ({pre_len} bytes) - evitando interação desnecessária.")
+            return True
+
         for attempt in range(self.max_retries):
             logger.info(f"Tentativa de bypass {attempt + 1}/{self.max_retries}")
 
@@ -322,18 +450,22 @@ class CloudflareBypasserEvolved:
                 token = self.get_turnstile_token()
                 if token and self._wait_real_page(timeout=25.0):
                     logger.info("Desafio Turnstile resolvido!")
+                    _log_phase("SUCESSO Turnstile")
                     return True
             else:
                 self.click_verify()
                 if self._wait_real_page(timeout=25.0):
                     logger.info("Desafio resolvido!")
+                    _log_phase("SUCESSO click_verify")
                     return True
 
             if self.is_access_denied():
+                _log_phase("FALHA access_denied")
                 return False
             time.sleep(3)
 
         logger.error(f"Falha após {self.max_retries} tentativas.")
+        _log_phase("FALHA max_retries")
         return False
 
     def clear_session(self):

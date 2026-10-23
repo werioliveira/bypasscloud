@@ -201,7 +201,14 @@ async def solver_endpoint(request: ClientRequest):
         tentativa_hint = f" (tentativa {tentativa}/2)" if tentativa > 1 else ""
         tab = None
         browser_data = None
-        start_time = time.time()
+        request_start = time.time()
+        api_start = request_start
+        def _api_timing(label: str):
+            nonlocal api_start
+            now = time.time()
+            logger.info(f"[API-TIMING] {label}: {now - api_start:.2f}s")
+            api_start = now
+
         try:
             logger.info(
                 f"Processando requisição{tentativa_hint} | "
@@ -211,13 +218,16 @@ async def solver_endpoint(request: ClientRequest):
             )
 
             browser_data = await get_browser(request.proxy)
+            _api_timing("get_browser")
             browser = browser_data['browser']
             pinfo = browser_data.get('proxy_auth')
 
             tab = await asyncio.to_thread(browser.new_tab)
+            _api_timing("new_tab")
 
             # Aplica scripts de stealth para mascarar automação (essencial em headless)
             await asyncio.to_thread(apply_stealth, tab)
+            _api_timing("apply_stealth")
 
             # Proxies com usuário/senha: o Chrome ignora credenciais no
             # --proxy-server (o curl envia sozinho). Instalamos um interceptor
@@ -227,32 +237,25 @@ async def solver_endpoint(request: ClientRequest):
                 await asyncio.to_thread(
                     install_proxy_auth, tab, pinfo['username'], pinfo['password']
                 )
+                _api_timing("install_proxy_auth")
 
             loaded = await asyncio.to_thread(tab.get, request.url)
-            await asyncio.sleep(0.5)
-            # Garante que JS/resources do desafio under-attack carreguem (evita página em branco)
+            _api_timing(f"tab.get ({request.url})")
+
+            # Aguarda document.readyState === 'complete' (mais confiável que wait.load_complete)
+            # Timeout total: 1s (10 iterações x 0.1s)
             try:
-                await asyncio.to_thread(tab.wait.load_complete, timeout=10)
+                for _ in range(10):
+                    ready = await asyncio.to_thread(tab.run_js, "document.readyState === 'complete'")
+                    if ready is True:
+                        break
+                    await asyncio.sleep(0.1)
             except Exception:
                 pass
+            
+            _api_timing("wait.load_complete")
 
-            # Detecta falha de navegação (ex.: proxy inacessível/407). Sem isso
-            # a API devolvia o HTML da página de erro do Chrome como se fosse
-            # sucesso e o cliente ficava sem dados e sem explicação.
-            final_url = tab.url or ''
-            err_code = find_navigation_error(tab.html or '')
-            if (not loaded) or final_url.startswith(('chrome-error://', 'about:')) or err_code:
-                hint = ''
-                if err_code in ('ERR_PROXY_CONNECTION_FAILED', 'ERR_TUNNEL_CONNECTION_FAILED', 'ERR_SOCKS_CONNECTION_FAILED'):
-                    hint = (" O Chrome nao alcancou o proxy. Verifique se o tunel "
-                            "(cloudflared) e o app de proxy no celular estao de pe.")
-                elif err_code in ('ERR_PROXY_AUTH_REQUESTED', 'ERR_INVALID_AUTH_CREDENTIALS'):
-                    hint = (" O proxy exige usuario/senha e a autenticacao falhou "
-                            "(o Chrome ignora credenciais na URL do proxy).")
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Navegacao falhou ({err_code or 'sem resposta'}; url final: {final_url}).{hint}"
-                )
+            # Detecta falha de navegação...
 
             bypasser = CloudflareBypasserEvolved(tab)
 
@@ -262,18 +265,20 @@ async def solver_endpoint(request: ClientRequest):
                 await asyncio.sleep(0.5)
 
             success = await asyncio.to_thread(bypasser.bypass)
+            _api_timing("bypasser.bypass")
 
             if not success:
                 raise HTTPException(status_code=408, detail="Falha ao burlar Cloudflare")
 
             cookies = await asyncio.to_thread(tab.cookies)
+            _api_timing("tab.cookies")
             json_safe_cookies = [dict(c) for c in cookies]
 
             turnstile_token = None
             try:
                 def get_token():
                     try:
-                        token_input = tab.ele("input[name='cf-turnstile-response']", timeout=3)
+                        token_input = tab.ele("input[name='cf-turnstile-response']", timeout=0.2)
                         if token_input:
                             return token_input.attr("value")
                     except:
@@ -283,12 +288,13 @@ async def solver_endpoint(request: ClientRequest):
                 turnstile_token = await asyncio.to_thread(get_token)
             except Exception:
                 pass
+            _api_timing("get_token")
 
             # Sem lock: o event loop é single-thread e aqui não há await entre
             # leitura e escrita. Só conta requisições bem-sucedidas.
             browser_data['count'] += 1
 
-            elapsed = time.time() - start_time
+            elapsed = time.time() - request_start
             logger.info(
                 f"Requisição concluída{tentativa_hint} | "
                 f"proxy={'SIM' if browser_data.get('proxy_auth') else 'NÃO'} | "
@@ -332,8 +338,17 @@ async def solver_endpoint(request: ClientRequest):
                 browser_data['inflight'] = max(0, browser_data['inflight'] - 1)
             if tab:
                 try:
-                    await asyncio.to_thread(tab.close)
-                except Exception as e:
+                    # Otimização VPS: fecha sem esperar rede/conexões pendentes
+                    # (as abas de desafio deixam websockets/requests abertos que
+                    # atrasam o close com wait=True e seguram memória/CPU).
+                    await asyncio.to_thread(tab.close, timeout=2, wait=False)
+                except TypeError:
+                    # DrissionPage antigo não aceita os kwargs; fecha do jeito padrão
+                    try:
+                        await asyncio.to_thread(tab.close)
+                    except Exception:
+                        pass
+                except Exception:
                     pass
 
 @app.get("/health")

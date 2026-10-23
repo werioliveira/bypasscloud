@@ -305,6 +305,21 @@ def create_browser(proxy=None, headless=None, instance_id: str = "default"):
             )
 
     # --- 5. PERFORMANCE ---
+    # Flags VPS-friendly (baixo CPU/RAM) — adicione VPS_MODE=1 no .env para ativar
+    is_vps = os.getenv("VPS_MODE", "0").lower() in ("1", "true", "yes")
+    if is_vps:
+        options.set_argument("--disable-background-timer-throttling")
+        options.set_argument("--disable-backgrounding-occluded-windows")
+        options.set_argument("--disable-renderer-backgrounding")
+        options.set_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees,NetworkService")
+        options.set_argument("--disable-ipc-flooding-protection")
+        options.set_argument("--metrics-recording-only")
+        options.set_argument("--disable-breakpad")
+        # Cache/memória
+        options.set_argument("--disk-cache-size=10485760")   # 10 MB
+        options.set_argument("--media-cache-size=5242880")    # 5 MB
+        logger.info("VPS_MODE ativo: flags de economia de CPU/RAM aplicadas")
+
     # Modo 'normal' (default) para garantir que JS do desafio under-attack carregue
     # (eager pode impedir execução do JS da Cloudflare, deixando a página em branco).
     try:
