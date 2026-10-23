@@ -239,7 +239,16 @@ async def solver_endpoint(request: ClientRequest):
                 )
                 _api_timing("install_proxy_auth")
 
-            loaded = await asyncio.to_thread(tab.get, request.url)
+            # Navegação com timeout de segurança (30s) para evitar travamento
+            # se o proxy auth interceptor não estiver funcionando
+            try:
+                loaded = await asyncio.wait_for(
+                    asyncio.to_thread(tab.get, request.url),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout ao navegar para {request.url} (proxy auth pode estar falhando)")
+                raise HTTPException(status_code=408, detail="Timeout na navegação (verifique proxy/auth)")
             _api_timing(f"tab.get ({request.url})")
 
             # Aguarda document.readyState === 'complete' (mais confiável que wait.load_complete)

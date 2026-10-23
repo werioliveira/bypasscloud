@@ -185,33 +185,55 @@ def install_proxy_auth(tab, username: str, password: str) -> bool:
         driver = tab._driver  # driver CDP da aba (mesmo objeto usado pelo listener)
 
         def _on_auth_required(**kwargs):
+            """Callback para requisições que exigem autenticação (407 Proxy Auth)."""
             try:
+                request_id = kwargs.get('requestId')
+                if not request_id:
+                    logger.debug("Fetch.authRequired sem requestId, ignorando")
+                    return
                 driver.run(
                     'Fetch.continueWithAuth',
-                    requestId=kwargs.get('requestId'),
+                    requestId=request_id,
                     response='ProvideCredentials',
                     username=username,
                     password=password,
                 )
-            except Exception:
+                logger.debug(f"Proxy auth fornecido para requestId={request_id}")
+            except Exception as e:
+                logger.warning(f"Erro ao fornecer credenciais de proxy: {e}")
                 try:
                     driver.run('Fetch.cancelAuth', requestId=kwargs.get('requestId'))
                 except Exception:
                     pass
 
         def _on_request_paused(**kwargs):
+            """Callback para requisições pausadas (padrão '*' intercepta tudo)."""
             try:
-                driver.run('Fetch.continueRequest', requestId=kwargs.get('requestId'))
-            except Exception:
-                pass
+                request_id = kwargs.get('requestId')
+                if not request_id:
+                    return
+                # Continua a requisição sem modificação
+                driver.run('Fetch.continueRequest', requestId=request_id)
+            except Exception as e:
+                logger.debug(f"Erro ao continuar request pausada: {e}")
 
-        driver.run('Fetch.enable', patterns=[{'urlPattern': '*'}], handleAuthRequests=True)
+        # 1. Registra callbacks ANTES de habilitar Fetch (evita race condition)
         driver.set_callback('Fetch.authRequired', _on_auth_required)
         driver.set_callback('Fetch.requestPaused', _on_request_paused)
+
+        # 2. Habilita Fetch domain apenas para authRequired (não pausa todas requests)
+        # patterns vazio + handleAuthRequests=True = só intercepta 407
+        driver.run('Fetch.enable', patterns=[], handleAuthRequests=True)
+
         logger.info("Interceptor de autenticação de proxy instalado (CDP Fetch).")
         return True
     except Exception as e:
         logger.error(f"Falha ao instalar interceptor de autenticação de proxy: {e}")
+        # Tenta desabilitar Fetch se falhou no meio
+        try:
+            driver.run('Fetch.disable')
+        except Exception:
+            pass
         return False
 
 
@@ -238,7 +260,7 @@ def create_browser(proxy=None, headless=None, instance_id: str = "default"):
     want_headless = False
     if is_windows:
         logger.info("Executando no Windows")
-        options.headless(False)
+        options.headless(True)
         # Janela maximizada como um Chrome real aberto pelo usuário
         options.set_argument("--start-maximized")
         # Porta FIXA por instância: auto_port() é incompatível com perfil
