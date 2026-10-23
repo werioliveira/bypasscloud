@@ -351,6 +351,28 @@ class CloudflareBypasserEvolved:
         # Loop de 10s expirou sem detectar desafio claro → verificação final leve
         st = self._page_state()
         if not (st.get('challengeScript') or st.get('suspect') or self._state_is_challenge(st)):
+            html_len = st.get('htmlLen', 0)
+            # Página muito pequena (< 500 bytes) sem desafio = carga falha, não sucesso
+            # Pode ser: proxy bloqueando conteúdo, JS não executou, SSL error, etc.
+            if html_len < 500:
+                logger.warning(
+                    f"Página carregada mas quase vazia (html_len={html_len}) sem indicadores de desafio. "
+                    f"Provável falha de carga (proxy/SSL/JS). Não trata como sucesso."
+                )
+                # Tenta recarregar uma vez antes de falhar
+                try:
+                    self.page.refresh()
+                    time.sleep(2.0)
+                    st2 = self._page_state()
+                    html_len2 = st2.get('htmlLen', 0)
+                    if html_len2 > 500:
+                        logger.info(f"Recarregamento funcionou: html_len={html_len2}")
+                        return True
+                    logger.error(f"Recarregamento não resolveu: html_len={html_len2}")
+                except Exception as e:
+                    logger.error(f"Erro ao tentar recarregar: {e}")
+                return False
+            
             logger.info("Nenhum desafio detectado após espera inicial.")
             _log_phase("FASE1 fim - sem desafio")
             return True
