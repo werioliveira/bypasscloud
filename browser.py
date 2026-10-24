@@ -217,17 +217,14 @@ def install_proxy_auth(tab, username: str, password: str) -> bool:
             except Exception as e:
                 logger.debug(f"Erro ao continuar request pausada: {e}")
 
-        # 1. Registra callbacks ANTES de habilitar Fetch (evita race condition)
+        # 1. Habilita Fetch domain para TODAS as requests (pattern '*')
+        # handleAuthRequests=True garante que authRequired seja disparado para 401/407
+        # IMPORTANTE: Fetch.enable ANTES dos callbacks (ordem importa no CDP)
+        driver.run('Fetch.enable', patterns=[{'urlPattern': '*'}], handleAuthRequests=True)
+
+        # 2. Registra callbacks DEPOIS do enable
         driver.set_callback('Fetch.authRequired', _on_auth_required)
         driver.set_callback('Fetch.requestPaused', _on_request_paused)
-
-        # 2. Habilita Fetch domain para TODAS as requests (pattern '*')
-        # handleAuthRequests=True garante que authRequired seja disparado para 401/407
-        # requestStage='Request' intercepta antes de enviar (necessário para proxy auth)
-        driver.run('Fetch.enable', 
-            patterns=[{'urlPattern': '*', 'requestStage': 'Request'}], 
-            handleAuthRequests=True
-        )
 
         logger.info("Interceptor de autenticação de proxy instalado (CDP Fetch).")
         return True
