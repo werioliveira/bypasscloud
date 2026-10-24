@@ -221,9 +221,13 @@ def install_proxy_auth(tab, username: str, password: str) -> bool:
         driver.set_callback('Fetch.authRequired', _on_auth_required)
         driver.set_callback('Fetch.requestPaused', _on_request_paused)
 
-        # 2. Habilita Fetch domain apenas para authRequired (não pausa todas requests)
-        # patterns vazio + handleAuthRequests=True = só intercepta 407
-        driver.run('Fetch.enable', patterns=[], handleAuthRequests=True)
+        # 2. Habilita Fetch domain para TODAS as requests (pattern '*')
+        # handleAuthRequests=True garante que authRequired seja disparado para 401/407
+        # requestStage='Request' intercepta antes de enviar (necessário para proxy auth)
+        driver.run('Fetch.enable', 
+            patterns=[{'urlPattern': '*', 'requestStage': 'Request'}], 
+            handleAuthRequests=True
+        )
 
         logger.info("Interceptor de autenticação de proxy instalado (CDP Fetch).")
         return True

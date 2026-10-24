@@ -279,6 +279,22 @@ async def solver_endpoint(request: ClientRequest):
             if not success:
                 raise HTTPException(status_code=408, detail="Falha ao burlar Cloudflare")
 
+            # Validação extra: se usa proxy e a resposta está vazia/quase vazia,
+            # trata como falha de proxy para forçar reciclagem/retry
+            html_content = tab.html or ''
+            if request.proxy and len(html_content) < 500:
+                logger.warning(
+                    f"Proxy ativo mas resposta quase vazia ({len(html_content)} bytes). "
+                    f"Possível falha do proxy (bloqueio/SSL/IP banido). Reciclando navegador..."
+                )
+                # Força reciclagem do navegador para próxima tentativa
+                await _recycle_browser(request.proxy)
+                raise HTTPException(
+                    status_code=502, 
+                    detail=f"Proxy retornou conteúdo vazio ({len(html_content)} bytes). "
+                           f"Verifique se o proxy está funcionando e o IP não está banido."
+                )
+
             cookies = await asyncio.to_thread(tab.cookies)
             _api_timing("tab.cookies")
             json_safe_cookies = [dict(c) for c in cookies]

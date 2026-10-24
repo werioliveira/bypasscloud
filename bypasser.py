@@ -371,6 +371,21 @@ class CloudflareBypasserEvolved:
                     logger.error(f"Recarregamento não resolveu: html_len={html_len2}")
                 except Exception as e:
                     logger.error(f"Erro ao tentar recarregar: {e}")
+                
+                # Diagnóstico extra: captura HTML real para debug
+                try:
+                    real_html = self.page.html or ''
+                    logger.warning(f"HTML real (primeiros 500 chars): {real_html[:500]}")
+                    # Salva para análise posterior
+                    import os
+                    os.makedirs('debug_html', exist_ok=True)
+                    fname = os.path.join('debug_html', f'empty_page_{time.strftime("%Y%m%d_%H%M%S")}.html')
+                    with open(fname, 'w', encoding='utf-8') as f:
+                        f.write(real_html)
+                    logger.info(f"HTML vazio salvo para diagnóstico: {fname}")
+                except Exception:
+                    pass
+                
                 return False
             
             logger.info("Nenhum desafio detectado após espera inicial.")
