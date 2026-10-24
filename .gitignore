@@ -39,3 +39,4 @@ teste_*.sh
 diag_*.sh
 tempo_*.txt
 resposta_teste*
+chrome_profiles/*

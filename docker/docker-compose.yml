@@ -1,17 +1,32 @@
-version: '3.8'
 services:
   bypasscloud:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    init: true
+    restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     shm_size: '2gb'
+    cpus: "1.5"
+    mem_limit: 3g
     extra_hosts:
-      # Garante que 'host.docker.internal' funcione também no Docker Engine Linux
       - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
-      # Navegadores com proxy abertos já no startup (separados por vírgula).
-      # Ex.: PREWARM_PROXIES=http://172.17.0.1:8989
+      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2}
+      - MAX_REQUESTS_BEFORE_RESTART=${MAX_REQUESTS_BEFORE_RESTART:-30}
+      - VPS_MODE=${VPS_MODE:-1}
+      - PROXY_AUTH_ALL_RESOURCES=${PROXY_AUTH_ALL_RESOURCES:-1}
       - PREWARM_PROXIES=${PREWARM_PROXIES:-}
+      # opcional, teste antes: - TZ=America/Sao_Paulo
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

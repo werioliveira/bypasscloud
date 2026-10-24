@@ -1,9 +1,25 @@
-# Acelera o build e evita copiar lixo para a imagem
+# Segredos e estado local
+.env
+.env.*
+chrome_profiles/
+debug_html/
+
+# Ambientes e caches
 venv/
+.venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Controle de versão e editor
 .git/
 .gitignore
-debug_html/
+.idea/
+.vscode/
+
+# Docs e logs
 *.md
+*.log
+
+# Build
 docker/

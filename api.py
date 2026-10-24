@@ -4,7 +4,7 @@ import logging
 import os
 import platform
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from models import ClientRequest, ClientResponse, Solution
 from utils import is_safe_url, find_navigation_error
 from bypasser import CloudflareBypasserEvolved, AccessDeniedException
@@ -16,13 +16,19 @@ logger = setup_logger("cloudflare-bypass.api")
 
 browsers_data = {}
 key_locks: dict = {}  # um lock POR proxy: requests de proxies diferentes rodam em paralelo
-MAX_CONCURRENT_REQUESTS = 5
+MAX_CONCURRENT_REQUESTS = max(1, int(os.getenv('MAX_CONCURRENT_REQUESTS', '2')))
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-MAX_REQUESTS_BEFORE_RESTART = 30
+MAX_REQUESTS_BEFORE_RESTART = int(os.getenv('MAX_REQUESTS_BEFORE_RESTART', '30'))
 
 # Navegadores com proxy abertos já no startup (separados por vírgula).
 # Ex.: PREWARM_PROXIES=http://172.17.0.1:8989,socks5://10.0.0.2:1080
 PREWARM_PROXIES = [p.strip() for p in os.getenv('PREWARM_PROXIES', '').split(',') if p.strip()]
+
+
+async def request_concurrency_slot():
+    """Limita browsers/abas ativos para evitar saturação de CPU e memória."""
+    async with semaphore:
+        yield
 
 
 def _get_key_lock(key: str) -> asyncio.Lock:
@@ -188,7 +194,7 @@ async def _recycle_browser(proxy: str = None):
 
 
 @app.post("/v1")
-async def solver_endpoint(request: ClientRequest):
+async def solver_endpoint(request: ClientRequest, _slot: None = Depends(request_concurrency_slot)):
     if not is_safe_url(request.url):
         raise HTTPException(status_code=400, detail="URL inválida")
 
@@ -242,10 +248,7 @@ async def solver_endpoint(request: ClientRequest):
             # Navegação com timeout de segurança (30s) para evitar travamento
             # se o proxy auth interceptor não estiver funcionando
             try:
-                loaded = await asyncio.wait_for(
-                    asyncio.to_thread(tab.get, request.url),
-                    timeout=30.0
-                )
+                loaded = await asyncio.wait_for(asyncio.to_thread(tab.get, request.url, timeout=12), timeout=30.0)
             except asyncio.TimeoutError:
                 logger.error(f"Timeout ao navegar para {request.url} (proxy auth pode estar falhando)")
                 raise HTTPException(status_code=408, detail="Timeout na navegação (verifique proxy/auth)")
@@ -333,7 +336,7 @@ async def solver_endpoint(request: ClientRequest):
                 solution=Solution(
                     url=tab.url,
                     status=200,
-                    response=tab.html,
+                    response=html_content,
                     userAgent=tab.user_agent,
                     cookies=json_safe_cookies,
                     turnstile_token=turnstile_token

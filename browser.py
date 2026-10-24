@@ -7,7 +7,7 @@ from urllib.parse import urlparse, unquote
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 logger = logging.getLogger("cloudflare-bypass.browser")
-
+PROXY_AUTH_ALL = os.getenv("PROXY_AUTH_ALL_RESOURCES", "0").lower() in ("1", "true", "yes")
 
 def parse_proxy(proxy) -> dict | None:
     """Faz o parse da URL do proxy e devolve metadados para o Chrome.
@@ -225,9 +225,11 @@ def install_proxy_auth(tab, username: str, password: str) -> bool:
         driver.set_callback('Fetch.requestPaused', _on_request_paused)
         # O Chrome não aceita patterns vazio com handleAuthRequests. Mantemos
         # o padrão global e retomamos cada request normal imediatamente.
+        patterns = [{'urlPattern': '*'}] if PROXY_AUTH_ALL \
+            else [{'urlPattern': '*', 'resourceType': 'Document'}]
         result = driver.run(
             'Fetch.enable',
-            patterns=[{'urlPattern': '*'}],
+            patterns=patterns,
             handleAuthRequests=True,
         )
         if isinstance(result, dict) and result.get('error'):
@@ -339,19 +341,21 @@ def create_browser(proxy=None, headless=None, instance_id: str = "default"):
 
     # --- 5. PERFORMANCE ---
     # Flags VPS-friendly (baixo CPU/RAM) — adicione VPS_MODE=1 no .env para ativar
+    options.set_argument("--disable-background-networking")
+    options.set_argument("--disable-component-update")
+    options.set_argument("--disable-sync")
+    options.set_argument("--no-first-run")
+    options.set_argument("--mute-audio")
     is_vps = os.getenv("VPS_MODE", "0").lower() in ("1", "true", "yes")
     if is_vps:
-        options.set_argument("--disable-background-timer-throttling")
-        options.set_argument("--disable-backgrounding-occluded-windows")
-        options.set_argument("--disable-renderer-backgrounding")
-        options.set_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees,NetworkService")
-        options.set_argument("--disable-ipc-flooding-protection")
+        # Mantém o throttling padrão do Chrome para timers/renderers em segundo
+        # plano. Desativá-lo mantém páginas ocultas executando sem necessidade.
         options.set_argument("--metrics-recording-only")
         options.set_argument("--disable-breakpad")
         # Cache/memória
         options.set_argument("--disk-cache-size=10485760")   # 10 MB
         options.set_argument("--media-cache-size=5242880")    # 5 MB
-        logger.info("VPS_MODE ativo: flags de economia de CPU/RAM aplicadas")
+        logger.info("VPS_MODE ativo: cache limitado e throttling padrão do Chrome preservado")
 
     # Modo 'normal' (default) para garantir que JS do desafio under-attack carregue
     # (eager pode impedir execução do JS da Cloudflare, deixando a página em branco).
