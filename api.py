@@ -229,14 +229,14 @@ async def solver_endpoint(request: ClientRequest):
             await asyncio.to_thread(apply_stealth, tab)
             _api_timing("apply_stealth")
 
-            # Proxies com usuário/senha: o Chrome ignora credenciais no
-            # --proxy-server (o curl envia sozinho). Instalamos um interceptor
-            # CDP para responder ao 407, senão TODA request pelo proxy falha
-            # e a aba exibe página de erro.
+            # Chrome ignora credenciais no argumento --proxy-server. Responde
+            # somente aos desafios 407 via CDP, sem interceptar requests normais.
             if pinfo and pinfo.get('needs_auth'):
-                await asyncio.to_thread(
+                auth_ready = await asyncio.to_thread(
                     install_proxy_auth, tab, pinfo['username'], pinfo['password']
                 )
+                if not auth_ready:
+                    raise HTTPException(status_code=502, detail="Falha ao configurar autenticação do proxy")
                 _api_timing("install_proxy_auth")
 
             # Navegação com timeout de segurança (30s) para evitar travamento

@@ -172,67 +172,77 @@ def apply_stealth(tab) -> bool:
 
 
 def install_proxy_auth(tab, username: str, password: str) -> bool:
-    """Instala um interceptor CDP para responder ao desafio 407 do proxy.
+    """Responde a desafios 407 do proxy via CDP, sem pausar requests comuns."""
+    driver = tab._driver
 
-    O Chrome ignora 'user:senha@' no argumento --proxy-server (diferente do
-    curl, que envia as credenciais automaticamente). Sem isso, toda request
-    pelo proxy falha com ERR_PROXY_AUTH_REQUESTED/407 e a aba exibe uma
-    página de erro -- por isso o bypass 'não traz dados'.
+    def _on_auth_required(**kwargs):
+        challenge = kwargs.get('authChallenge') or {}
+        request_id = kwargs.get('requestId')
+        if not request_id:
+            logger.warning("Fetch.authRequired sem requestId")
+            return
 
-    Usa o domínio Fetch do CDP (mesma técnica do Puppeteer/Playwright).
-    """
+        is_proxy_challenge = challenge.get('source') == 'Proxy'
+        auth_response = {
+            'response': 'ProvideCredentials' if is_proxy_challenge else 'Default'
+        }
+        if is_proxy_challenge:
+            auth_response.update(username=username, password=password)
+
+        try:
+            result = driver.run(
+                'Fetch.continueWithAuth',
+                requestId=request_id,
+                authChallengeResponse=auth_response,
+            )
+            if isinstance(result, dict) and result.get('error'):
+                logger.error(f"Falha ao responder desafio de autenticação do proxy: {result['error']}")
+            elif is_proxy_challenge:
+                logger.debug("Credenciais fornecidas ao desafio de autenticação do proxy")
+        except Exception as e:
+            logger.exception(f"Exceção ao responder desafio de autenticação do proxy: {e}")
+
+    def _on_request_paused(**kwargs):
+        request_id = kwargs.get('requestId')
+        if not request_id:
+            return
+        try:
+            result = driver.run('Fetch.continueRequest', requestId=request_id)
+            if isinstance(result, dict) and result.get('error'):
+                if result.get('type') == 'connection_error' or result.get('error') == 'connection disconnected':
+                    logger.debug("Chrome desconectou após encerrar a navegação; request interceptada ignorada.")
+                    return
+                logger.error(f"Falha ao continuar requisição interceptada: {result['error']}")
+        except Exception as e:
+            if not getattr(driver, 'is_running', True):
+                logger.debug("Chrome desconectou após encerrar a navegação; request interceptada ignorada.")
+                return
+            logger.exception(f"Exceção ao continuar requisição interceptada: {e}")
+
     try:
-        driver = tab._driver  # driver CDP da aba (mesmo objeto usado pelo listener)
-
-        def _on_auth_required(**kwargs):
-            """Callback para requisições que exigem autenticação (407 Proxy Auth)."""
-            try:
-                request_id = kwargs.get('requestId')
-                if not request_id:
-                    logger.debug("Fetch.authRequired sem requestId, ignorando")
-                    return
-                driver.run(
-                    'Fetch.continueWithAuth',
-                    requestId=request_id,
-                    response='ProvideCredentials',
-                    username=username,
-                    password=password,
-                )
-                logger.debug(f"Proxy auth fornecido para requestId={request_id}")
-            except Exception as e:
-                logger.warning(f"Erro ao fornecer credenciais de proxy: {e}")
-                try:
-                    driver.run('Fetch.cancelAuth', requestId=kwargs.get('requestId'))
-                except Exception:
-                    pass
-
-        def _on_request_paused(**kwargs):
-            """Callback para requisições pausadas (padrão '*' intercepta tudo)."""
-            try:
-                request_id = kwargs.get('requestId')
-                if not request_id:
-                    return
-                # Continua a requisição sem modificação
-                driver.run('Fetch.continueRequest', requestId=request_id)
-            except Exception as e:
-                logger.debug(f"Erro ao continuar request pausada: {e}")
-
-        # 1. Habilita Fetch domain para TODAS as requests (pattern '*')
-        # handleAuthRequests=True garante que authRequired seja disparado para 401/407
-        # IMPORTANTE: Fetch.enable ANTES dos callbacks (ordem importa no CDP)
-        driver.run('Fetch.enable', patterns=[{'urlPattern': '*'}], handleAuthRequests=True)
-
-        # 2. Registra callbacks DEPOIS do enable
+        # Registra antes de habilitar eventos para não perder um 407 rápido.
         driver.set_callback('Fetch.authRequired', _on_auth_required)
         driver.set_callback('Fetch.requestPaused', _on_request_paused)
-
-        logger.info("Interceptor de autenticação de proxy instalado (CDP Fetch).")
+        # O Chrome não aceita patterns vazio com handleAuthRequests. Mantemos
+        # o padrão global e retomamos cada request normal imediatamente.
+        result = driver.run(
+            'Fetch.enable',
+            patterns=[{'urlPattern': '*'}],
+            handleAuthRequests=True,
+        )
+        if isinstance(result, dict) and result.get('error'):
+            driver.set_callback('Fetch.authRequired', None)
+            driver.set_callback('Fetch.requestPaused', None)
+            logger.error(f"Falha ao habilitar autenticação CDP: {result['error']}")
+            return False
+        logger.info("Autenticação de proxy configurada via CDP.")
         return True
     except Exception as e:
-        logger.error(f"Falha ao instalar interceptor de autenticação de proxy: {e}")
-        # Tenta desabilitar Fetch se falhou no meio
+        logger.error(f"Falha ao configurar autenticação do proxy: {e}")
         try:
             driver.run('Fetch.disable')
+            driver.set_callback('Fetch.authRequired', None)
+            driver.set_callback('Fetch.requestPaused', None)
         except Exception:
             pass
         return False
